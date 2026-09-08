@@ -1,0 +1,31 @@
+# Android
+*.iml
+.gradle/
+/local.properties
+/.idea/
+/build/
+/android/app/build/
+/android/.gradle/
+/android/build/
+/android/captures/
+.externalNativeBuild/
+.cxx/
+
+# C++ Build
+core/build/
+core/.cxx/
+*.o
+*.so
+*.a
+
+# Models (large files)
+models/*.gguf
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+*.hprof
