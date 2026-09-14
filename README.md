@@ -127,6 +127,10 @@ EdgePilot/
 
 > 当前测试基于 TinyLlama 1.1B Q4_K_M 量化模型，在模拟器上主要验证推理链路完整性。
 
+## 版本迭代规划
+
+见 [ROADMAP.md](ROADMAP.md) — 从数据可信、真机基线到 KV Cache 优化与推测解码的完整路线图。
+
 ## 核心指标说明
 
 - **TTFT (Time to First Token)** — 从发送请求到首个 token 生成的延迟
