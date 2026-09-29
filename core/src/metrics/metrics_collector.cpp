@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <iomanip>
 #include <numeric>
 #include <unordered_map>
@@ -17,7 +18,7 @@ std::string json_sanitize(const std::string& s) {
     out.reserve(s.size());
     for (char c : s) {
         const unsigned char u = static_cast<unsigned char>(c);
-        if (std::isalnum(u) || c=='-' || c=='_' || c=='.') out += c;
+        if (std::isalnum(u) || c=='-' || c=='_' || c=='.' || c=='/') out += c;  // '/' 保留：power_path 为绝对路径（R8）
     }
     return out;
 }
@@ -44,6 +45,7 @@ struct MetricsCollector::Impl {
     bool sampler_probed = false;
     std::mutex win_mtx;                                // 独立于 mutex：避免与记录锁交叉
     bool window_open = false;
+    uint64_t window_seq = 0;   // 窗世代：beginWindow 递增，封死 end→begin 背靠背时旧窗样本混入新窗（R8）
     std::vector<PowerSample> win_power;
     std::vector<ThermalSample> win_thermal;
     std::vector<MemSample> win_mem;
@@ -56,14 +58,16 @@ struct MetricsCollector::Impl {
     void collectionLoop() {
         while (running.load()) {
             bool open;
-            { std::lock_guard<std::mutex> lk(win_mtx); open = window_open; }
+            uint64_t seq;
+            { std::lock_guard<std::mutex> lk(win_mtx); open = window_open; seq = window_seq; }
             if (open) {
                 PowerSample ps; ThermalSample ts; MemSample ms;
                 const bool rp = sampler.readPower(ps);
                 const bool rt = sampler.readThermal(ts);
                 const bool rm = sampler.readMem(ms);
                 std::lock_guard<std::mutex> lk(win_mtx);
-                if (window_open) {   // 二次确认：endWindow 可能在三读之间发生
+                // 二次确认：endWindow 可能在三读之间发生；seq 相等排除 end→begin 背靠背的跨窗混入（R8）
+                if (window_open && window_seq == seq) {
                     if (rp) {
                         if (win_power.size() >= kMaxWinSamples) win_power.erase(win_power.begin());
                         win_power.push_back(ps);
@@ -291,6 +295,7 @@ void MetricsCollector::beginWindow() {
     impl_->win_power.clear();
     impl_->win_thermal.clear();
     impl_->win_mem.clear();
+    ++impl_->window_seq;   // 在途旧窗样本的二次确认将因 seq 不符被丢弃（R8）
     impl_->window_open = true;
 }
 
