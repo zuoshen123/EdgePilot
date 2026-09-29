@@ -69,7 +69,8 @@ fun MainApp(viewModel: BenchmarkViewModel = viewModel()) {
                     uiState = viewModel.uiState,
                     onDetectHardware = { viewModel.detectHardware() },
                     onLoadModel = { viewModel.loadModel(it) },
-                    onRunBenchmark = { viewModel.runBenchmark(it) }
+                    onRunBenchmark = { viewModel.runBenchmark(it) },
+                    onCancelBenchmark = viewModel::cancelRun
                 )
                 1 -> MetricsScreen(
                     result = viewModel.uiState.result,

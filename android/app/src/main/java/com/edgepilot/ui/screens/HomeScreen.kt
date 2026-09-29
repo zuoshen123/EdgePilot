@@ -20,7 +20,8 @@ fun HomeScreen(
     uiState: BenchmarkUiState,
     onDetectHardware: () -> Unit,
     onLoadModel: (String) -> Unit,
-    onRunBenchmark: (String) -> Unit
+    onRunBenchmark: (String) -> Unit,
+    onCancelBenchmark: () -> Unit
 ) {
     var promptText by remember { mutableStateOf("Explain quantum computing in simple terms") }
     var modelPath by remember { mutableStateOf("/data/data/com.edgepilot/files/models/tinyllama.gguf") }
@@ -53,6 +54,7 @@ fun HomeScreen(
                 prompt = promptText,
                 onPromptChange = { promptText = it },
                 onRun = { onRunBenchmark(promptText) },
+                onCancel = onCancelBenchmark,
                 isRunning = uiState.isRunning,
                 enabled = uiState.modelLoaded
             )
@@ -68,7 +70,7 @@ fun HomeScreen(
         // 生成的文本
         if (uiState.generatedText.isNotEmpty()) {
             item {
-                GeneratedTextCard(uiState.generatedText)
+                GeneratedTextCard(uiState.generatedText + if (uiState.isRunning) " ▌" else "")
             }
         }
 
@@ -167,6 +169,7 @@ private fun BenchmarkInputCard(
     prompt: String,
     onPromptChange: (String) -> Unit,
     onRun: () -> Unit,
+    onCancel: () -> Unit,
     isRunning: Boolean,
     enabled: Boolean
 ) {
@@ -192,22 +195,30 @@ private fun BenchmarkInputCard(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Button(
-                onClick = onRun,
-                enabled = enabled && !isRunning && prompt.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = Secondary)
-            ) {
-                if (isRunning) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        color = Color.White
+            if (isRunning) {
+                Button(
+                    onClick = onCancel,
+                    enabled = enabled,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                ) {
+                    Icon(Icons.Default.Stop, contentDescription = null)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("停止生成")
                 }
-                Icon(Icons.Default.PlayArrow, contentDescription = null)
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(if (isRunning) "推理中..." else "开始推理")
+            } else {
+                Button(
+                    onClick = onRun,
+                    enabled = enabled && prompt.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Secondary)
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("开始推理")
+                }
             }
         }
     }

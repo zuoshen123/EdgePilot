@@ -46,6 +46,16 @@ object NativeEngine {
     external fun nativeInit(modelPath: String): Boolean
     external fun nativeGetHardwareInfo(): String
     external fun nativeGenerate(prompt: String, maxTokens: Int): String
+
+    /** 流式生成回调（在 native 调用线程触发，实现方自行切主线程） */
+    interface StreamListener {
+        fun onToken(piece: String, tokenId: Int)
+        fun onDone(resultJson: String)
+    }
+
+    external fun nativeGenerateStream(prompt: String, maxTokens: Int, listener: Any)
+    external fun nativeCancel()
+
     external fun nativeGetMetrics(): String
     external fun nativeRelease()
 
@@ -122,6 +132,46 @@ object NativeEngine {
                 itlP99Ms = (per * 1.2).toFloat(),
                 itlSeries = List(n - 1) { per }
             )
+        }
+    }
+
+    /**
+     * 流式生成：逐 token 回调，结束后 onDone 携带完整指标 JSON。
+     * 调用线程即回调线程，会阻塞到生成结束（应在后台线程调用）。
+     * @return 是否成功启动（false = 未初始化/mock 环境失败）
+     */
+    fun generateStream(prompt: String, maxTokens: Int, listener: StreamListener): Boolean {
+        return if (nativeAvailable) {
+            try {
+                nativeGenerateStream(prompt, maxTokens, listener)
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "generateStream 失败: ${e.message}", e)
+                false
+            }
+        } else {
+            // Mock 流式：逐词吐出，模拟打字机
+            Thread {
+                "[Mock 流式] 这是 EdgePilot 的模拟逐 token 输出。".split(" ").forEachIndexed { i, w ->
+                    listener.onToken(w + " ", i)
+                    Thread.sleep(80)
+                }
+                listener.onDone("{\"text\":\"[Mock 流式] 这是 EdgePilot 的模拟逐 token 输出。\"," +
+                    "\"total_tokens\":10,\"tokens_per_sec\":12.5,\"ttft_ms\":120," +
+                    "\"total_time_ms\":800,\"itl_avg_ms\":75.5,\"itl_p50_ms\":75," +
+                    "\"itl_p90_ms\":90,\"itl_p99_ms\":95,\"itl_series\":[80,75,70,75,80,75,70,75,75]}")
+            }.start()
+            true
+        }
+    }
+
+    fun cancel() {
+        if (nativeAvailable) {
+            try {
+                nativeCancel()
+            } catch (e: Exception) {
+                Log.e(TAG, "cancel 失败: ${e.message}")
+            }
         }
     }
 

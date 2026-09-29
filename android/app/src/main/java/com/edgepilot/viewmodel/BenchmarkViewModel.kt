@@ -85,48 +85,64 @@ class BenchmarkViewModel : ViewModel() {
             uiState = uiState.copy(error = "模型未加载")
             return
         }
+        if (uiState.isRunning) return
+
+        uiState = uiState.copy(
+            isRunning = true,
+            currentPrompt = prompt,
+            generatedText = "",
+            result = null,
+            error = null
+        )
+        addLog("流式推理开始: prompt=${prompt.take(40)}…, maxTokens=$maxTokens")
+
+        val listener = object : NativeEngine.StreamListener {
+            override fun onToken(piece: String, tokenId: Int) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    uiState = uiState.copy(generatedText = uiState.generatedText + piece)
+                }
+            }
+
+            override fun onDone(resultJson: String) {
+                val output = NativeEngine.parseGenerateOutput(resultJson)
+                viewModelScope.launch(Dispatchers.Main) {
+                    val expected = (output.totalTokens - 1).coerceAtLeast(0)
+                    if (output.itlSeries.size != expected)
+                        addLog("警告: ITL序列 ${output.itlSeries.size} != 预期 $expected")
+                    uiState = uiState.copy(
+                        isRunning = false,
+                        result = BenchmarkResult(
+                            ttftMs = output.ttftMs,
+                            itlAvgMs = output.itlAvgMs,
+                            itlP50Ms = output.itlP50Ms,
+                            itlP90Ms = output.itlP90Ms,
+                            itlP99Ms = output.itlP99Ms,
+                            tokensPerSec = output.tokensPerSec,
+                            totalTokens = output.totalTokens,
+                            totalTimeMs = output.totalTimeMs,
+                            itlSeries = output.itlSeries
+                        )
+                    )
+                    addLog("推理完成: ${output.totalTokens} tokens, ${output.totalTimeMs.toInt()}ms, " +
+                        "TTFT ${output.ttftMs.toInt()}ms, ${String.format("%.1f", output.tokensPerSec)} tok/s")
+                }
+            }
+        }
 
         viewModelScope.launch {
-            uiState = uiState.copy(
-                isRunning = true,
-                currentPrompt = prompt,
-                generatedText = "",
-                error = null
-            )
-            addLog("开始推理: prompt=$prompt, maxTokens=$maxTokens")
-
-            try {
-                val output = withContext(Dispatchers.Default) {
-                    NativeEngine.generate(prompt, maxTokens)
-                }
-
-                // 运行时自检：ITL 序列长度必须 = totalTokens - 1
-                val expected = (output.totalTokens - 1).coerceAtLeast(0)
-                if (output.itlSeries.size != expected)
-                    addLog("警告: ITL序列 ${output.itlSeries.size} != 预期 $expected")
-
-                uiState = uiState.copy(
-                    isRunning = false,
-                    generatedText = output.text,
-                    result = BenchmarkResult(
-                        ttftMs = output.ttftMs,
-                        itlAvgMs = output.itlAvgMs,
-                        itlP50Ms = output.itlP50Ms,
-                        itlP90Ms = output.itlP90Ms,
-                        itlP99Ms = output.itlP99Ms,
-                        totalTokens = output.totalTokens,
-                        totalTimeMs = output.totalTimeMs,
-                        tokensPerSec = output.tokensPerSec,
-                        itlSeries = output.itlSeries
-                    )
-                )
-                addLog("推理完成: ${output.totalTokens} tokens, ${output.totalTimeMs.toInt()}ms, ${output.tokensPerSec} tok/s")
-            } catch (e: Exception) {
-                uiState = uiState.copy(
-                    isRunning = false,
-                    error = "推理失败: ${e.message}"
-                )
+            val started = withContext(Dispatchers.Default) {
+                NativeEngine.generateStream(prompt, maxTokens, listener)
             }
+            if (!started) {
+                uiState = uiState.copy(isRunning = false, error = "流式推理启动失败")
+            }
+        }
+    }
+
+    fun cancelRun() {
+        if (uiState.isRunning) {
+            NativeEngine.cancel()
+            addLog("已请求停止生成")
         }
     }
 
