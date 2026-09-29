@@ -15,8 +15,8 @@
 
 - **硬件检测** — 识别 SoC、RAM、GPU 信息，自动推荐推理配置
 - **模型加载** — 支持 GGUF 格式模型（TinyLlama 等），自动适配量化方案
-- **文本生成** — 基于 llama.cpp 的同步/异步推理，支持流式输出
-- **性能指标** — 实时采集 TTFT、ITL、吞吐量等关键指标
+- **文本生成** — 流式逐 token 输出（打字机），支持中途停止；同步 API 供基准测试使用
+- **性能指标** — 逐 token 采集 TTFT、ITL（Avg/P50/P90/P99）、吞吐量，全部来自真实推理
 - **KV Cache 管理** — 支持导出、导入、压缩 KV Cache
 
 ## 技术架构
@@ -45,6 +45,7 @@
 | 层级 | 技术 |
 |---|---|
 | UI | Jetpack Compose + Material 3 |
+| 调试日志 | 编译期宏 `EP_LOGGING`（默认裁剪，`-PepLogging=true` 开启） |
 | 状态管理 | ViewModel + StateFlow |
 | 原生桥接 | JNI (C++ ↔ Kotlin) |
 | 推理引擎 | llama.cpp (静态链接) |
@@ -136,6 +137,7 @@ EdgePilot/
 - **TTFT (Time to First Token)** — 从发送请求到首个 token 生成的延迟
 - **ITL (Inter-Token Latency)** — 相邻 token 之间的生成间隔
 - **Throughput** — 每秒生成的 token 数量 (tok/s)
+- **ITL 分位数** — P50/P90/P99 由 native 层对相邻 token 时间戳差值直接计算（nearest-rank），非均值估算
 
 ## License
 
