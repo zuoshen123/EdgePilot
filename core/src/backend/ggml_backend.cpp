@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <numeric>
@@ -19,6 +20,36 @@
 #endif
 
 namespace edgepilot {
+
+// nearest-rank 分位数：idx = ceil(q*n) - 1（升序数组）
+static double percentile_nearest_rank(const std::vector<double>& sorted, double q) {
+    if (sorted.empty()) return 0.0;
+    size_t idx = static_cast<size_t>(std::ceil(q * static_cast<double>(sorted.size())));
+    if (idx == 0) idx = 1;
+    if (idx > sorted.size()) idx = sorted.size();
+    return sorted[idx - 1];
+}
+
+// 由逐 token 生成时刻序列计算 ITL 统计（序列本身 + avg/P50/P90/P99）
+static void compute_itl_metrics(GenerateResult& r, const std::vector<double>& token_times) {
+    r.itl_series_ms.clear();
+    for (size_t i = 1; i < token_times.size(); ++i)
+        r.itl_series_ms.push_back(token_times[i] - token_times[i - 1]);
+
+    if (r.itl_series_ms.empty()) {
+        r.itl_avg_ms = r.itl_p50_ms = r.itl_p90_ms = r.itl_p99_ms = 0.0f;
+        return;
+    }
+    double sum = 0.0;
+    for (double v : r.itl_series_ms) sum += v;
+    r.itl_avg_ms = static_cast<float>(sum / static_cast<double>(r.itl_series_ms.size()));
+
+    auto sorted = r.itl_series_ms;
+    std::sort(sorted.begin(), sorted.end());
+    r.itl_p50_ms = static_cast<float>(percentile_nearest_rank(sorted, 0.50));
+    r.itl_p90_ms = static_cast<float>(percentile_nearest_rank(sorted, 0.90));
+    r.itl_p99_ms = static_cast<float>(percentile_nearest_rank(sorted, 0.99));
+}
 
 // ============================================================================
 // GgmlBackend::Impl — 内部实现
@@ -42,6 +73,7 @@ struct GgmlBackend::Impl {
     int64_t     total_tokens_generated = 0;
     double      total_generation_ms    = 0.0;
     std::vector<double> itl_history;
+    GenerateResult last_metrics{};
 
     // ---- 工具方法 ----
 
@@ -170,6 +202,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     impl_->cancelled = false;
 
     double gen_start = Impl::now_ms();
+    std::vector<double> token_times;
 
     // Tokenize prompt
     auto prompt_tokens = impl_->tokenize(request.prompt, true);
@@ -211,6 +244,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
         result.generated_text += piece;
         result.generated_tokens.push_back(static_cast<int>(new_token_id));
         result.total_tokens++;
+        token_times.push_back(Impl::now_ms());
 
         llama_batch next_batch = llama_batch_get_one(&new_token_id, 1);
         if (llama_decode(impl_->ctx, next_batch) != 0) break;
@@ -222,6 +256,9 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     if (result.total_tokens > 0 && result.total_time_ms > 0) {
         result.tokens_per_sec = result.total_tokens / (result.total_time_ms / 1000.0f);
     }
+
+    compute_itl_metrics(result, token_times);
+    impl_->last_metrics = result;   // generate() 顶部已全程持有 impl_->mtx，此处直接赋值、切勿再次加锁（非递归锁会死锁）
 
     impl_->total_tokens_generated += result.total_tokens;
     impl_->total_generation_ms += result.total_time_ms;
@@ -244,6 +281,10 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
     state_ = InferenceState::DECODING;
     std::lock_guard<std::mutex> lock(impl_->mtx);
     impl_->cancelled = false;
+
+    double gen_start = Impl::now_ms();
+    std::vector<double> token_times;
+    GenerateResult run{};
 
     auto prompt_tokens = impl_->tokenize(request.prompt, true);
     if (prompt_tokens.empty()) {
@@ -285,6 +326,14 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
         tr.token_id = static_cast<int>(new_token_id);
         tr.token_text = impl_->tokenToPiece(new_token_id);
         tr.is_eos = false;
+
+        token_times.push_back(Impl::now_ms());
+        run.generated_text += tr.token_text;
+        run.generated_tokens.push_back(tr.token_id);
+        run.total_tokens++;
+        if (run.total_tokens == 1)
+            run.ttft_ms = static_cast<float>(Impl::now_ms() - gen_start);
+
         callback(tr);
 
         llama_batch next_batch = llama_batch_get_one(&new_token_id, 1);
@@ -295,6 +344,14 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
         }
         impl_->n_past++;
     }
+
+    run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
+    if (run.total_tokens > 0 && run.total_time_ms > 0)
+        run.tokens_per_sec = run.total_tokens / (run.total_time_ms / 1000.0f);
+    compute_itl_metrics(run, token_times);
+    impl_->last_metrics = run;      // 全程持锁，安全
+    impl_->total_tokens_generated += run.total_tokens;
+    impl_->total_generation_ms += run.total_time_ms;
 
     state_ = InferenceState::IDLE;
 }
@@ -428,6 +485,11 @@ KVCacheInfo GgmlBackend::getKVCacheInfo() const {
 InferenceState GgmlBackend::getState() const { return state_; }
 
 std::string GgmlBackend::getName() const { return "llama.cpp (GGML)"; }
+
+GenerateResult GgmlBackend::getLastMetrics() const {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    return impl_->last_metrics;
+}
 
 std::vector<uint8_t> GgmlBackend::exportKVCache() const { return {}; }
 bool GgmlBackend::importKVCache(const std::vector<uint8_t>&) { return false; }

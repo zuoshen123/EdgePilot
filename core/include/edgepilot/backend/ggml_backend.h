@@ -41,6 +41,8 @@ public:
     InferenceState getState() const override;
     std::string getName() const override;
 
+    GenerateResult getLastMetrics() const override;
+
     std::vector<uint8_t> exportKVCache() const override;
     bool importKVCache(const std::vector<uint8_t>& data) override;
     void clearKVCache() override;

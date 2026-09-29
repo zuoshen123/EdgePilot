@@ -101,10 +101,13 @@ struct GenerateResult {
     // 性能指标
     float ttft_ms;
     float itl_avg_ms;
+    float itl_p50_ms;
+    float itl_p90_ms;
     float itl_p99_ms;
     float tokens_per_sec;
     int total_tokens;
     float total_time_ms;
+    std::vector<double> itl_series_ms;   // 相邻 token 间隔(ms)，size = total_tokens-1
     // 投机采样统计
     int draft_tokens_proposed;
     int draft_tokens_accepted;

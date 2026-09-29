@@ -50,6 +50,9 @@ public:
     virtual std::vector<TokenResult> verifyTokens(
         const std::vector<int>& candidates) = 0;
 
+    /// 上一次生成（generate 或 generateAsync）的完整结果与指标
+    virtual GenerateResult getLastMetrics() const { return {}; }
+
     // ---- 硬件 & 状态 ----
 
     /// 获取硬件能力
