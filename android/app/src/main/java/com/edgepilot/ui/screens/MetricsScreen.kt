@@ -15,6 +15,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.edgepilot.ui.theme.*
+import java.util.Locale
 import com.edgepilot.viewmodel.BenchmarkResult
 
 @Composable
@@ -71,8 +72,8 @@ fun MetricsScreen(
                 description = "Target: > 30 tok/s"
             )
 
-            // 功耗曲线（v0.3 接入真实数据）
-            PowerChart()
+            // 功耗曲线（v0.3 真实数据；能力降级时诚实占位）
+            PowerChart(result.powerTimeline.ifEmpty { null }, result.energyMj, result.totalTokens)
 
             // Token 延迟瀑布图（真实 ITL 序列）
             TokenTimeChart(result.ttftMs, result.itlSeries)
@@ -107,14 +108,15 @@ private fun MetricCard(
 }
 
 @Composable
-private fun PowerChart(powerSeries: List<Float>? = null) {
+private fun PowerChart(powerSeries: List<Float>?, energyMj: Float, totalTokens: Int) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text("Power Consumption", style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold)
-            if (powerSeries == null || powerSeries.size < 2) {
+            // T6b 守卫：null / 样本<2 / 全 0 或负 → 占位分支（无数据不画线，不伪造）
+            if (powerSeries == null || powerSeries.size < 2 || powerSeries.max() <= 0f) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Text("真机功耗数据 · v0.3 接入（需物理设备电量/电流采集）",
+                Text("本设备无可用功耗通道（能力矩阵降级）——不伪造曲线",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
                 Spacer(modifier = Modifier.height(8.dp))
@@ -127,6 +129,21 @@ private fun PowerChart(powerSeries: List<Float>? = null) {
                         Offset(0f, 0f), Offset(0f, size.height), stroke)
                 }
             } else {
+                val avgMW = powerSeries.average()
+                val peakMW = powerSeries.max()
+                val energyJ = energyMj / 1000.0
+                val tokPerJ = if (energyJ > 0.001 && totalTokens > 0)
+                    totalTokens / energyJ else Double.NaN
+                Text(
+                    "峰值 ${String.format(Locale.US, "%.0f", peakMW)}mW · " +
+                        "均值 ${String.format(Locale.US, "%.0f", avgMW)}mW · " +
+                        "能耗 ${String.format(Locale.US, "%.2f", energyJ)}J · " +
+                        (if (tokPerJ.isNaN()) "tok/J —" else
+                            "tok/J ${String.format(Locale.US, "%.1f", tokPerJ)}") +
+                        " · 来源:sysfs",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                )
                 Spacer(modifier = Modifier.height(8.dp))
                 Canvas(modifier = Modifier.fillMaxWidth().height(120.dp)) {
                     val maxVal = powerSeries.max()
