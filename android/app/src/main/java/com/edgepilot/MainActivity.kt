@@ -7,10 +7,12 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.edgepilot.ui.screens.BaselineScreen
 import com.edgepilot.ui.screens.HomeScreen
 import com.edgepilot.ui.screens.MetricsScreen
 import com.edgepilot.ui.theme.EdgePilotTheme
@@ -60,6 +62,12 @@ fun MainApp(viewModel: BenchmarkViewModel = viewModel()) {
                     icon = { Icon(Icons.Default.Info, "Metrics") },
                     label = { Text("指标") }
                 )
+                NavigationBarItem(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    icon = { Icon(Icons.Default.List, "基线") },
+                    label = { Text("基线") }
+                )
             }
         }
     ) { padding ->
@@ -76,6 +84,7 @@ fun MainApp(viewModel: BenchmarkViewModel = viewModel()) {
                     result = viewModel.uiState.result,
                     metricsJson = ""
                 )
+                2 -> BaselineScreen()
             }
         }
     }
