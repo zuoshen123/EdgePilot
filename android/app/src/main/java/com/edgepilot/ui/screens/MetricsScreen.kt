@@ -71,11 +71,11 @@ fun MetricsScreen(
                 description = "Target: > 30 tok/s"
             )
 
-            // 模拟功耗曲线
+            // 功耗曲线（v0.3 接入真实数据）
             PowerChart()
 
-            // 模拟 Token 时间分布
-            TokenTimeChart()
+            // Token 延迟瀑布图（真实 ITL 序列）
+            TokenTimeChart(result.ttftMs, result.itlSeries)
         } else {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Text(
@@ -107,74 +107,82 @@ private fun MetricCard(
 }
 
 @Composable
-private fun PowerChart() {
-    // 模拟功耗数据
-    val data = listOf(1200f, 1800f, 2400f, 2100f, 1900f, 2200f, 1600f, 1400f,
-                      2000f, 2500f, 2300f, 1800f, 1500f, 1700f, 2100f, 1900f)
-
+private fun PowerChart(powerSeries: List<Float>? = null) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text("Power Consumption (mW)", style = MaterialTheme.typography.titleMedium,
+            Text("Power Consumption", style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Canvas(modifier = Modifier.fillMaxWidth().height(120.dp)) {
-                val maxVal = data.max()
-                val stepX = size.width / (data.size - 1)
-
-                val path = Path()
-                data.forEachIndexed { index, value ->
-                    val x = index * stepX
-                    val y = size.height - (value / maxVal * size.height)
-                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            if (powerSeries == null || powerSeries.size < 2) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("真机功耗数据 · v0.3 接入（需物理设备电量/电流采集）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+                Spacer(modifier = Modifier.height(8.dp))
+                // 空坐标框
+                Canvas(modifier = Modifier.fillMaxWidth().height(120.dp)) {
+                    val stroke = 1.dp.toPx()
+                    drawLine(Color.Gray.copy(alpha = 0.3f),
+                        Offset(0f, size.height), Offset(size.width, size.height), stroke)
+                    drawLine(Color.Gray.copy(alpha = 0.3f),
+                        Offset(0f, 0f), Offset(0f, size.height), stroke)
                 }
-
-                drawPath(path, MetricGood, style = Stroke(width = 2.dp.toPx()))
-
-                // 基准线
-                val baselineY = size.height - (2000f / maxVal * size.height)
-                drawLine(
-                    MetricWarn,
-                    Offset(0f, baselineY),
-                    Offset(size.width, baselineY),
-                    strokeWidth = 1.dp.toPx()
-                )
+            } else {
+                Spacer(modifier = Modifier.height(8.dp))
+                Canvas(modifier = Modifier.fillMaxWidth().height(120.dp)) {
+                    val maxVal = powerSeries.max()
+                    val stepX = size.width / (powerSeries.size - 1)
+                    val path = Path()
+                    powerSeries.forEachIndexed { index, value ->
+                        val x = index * stepX
+                        val y = size.height - (value / maxVal * size.height)
+                        if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    }
+                    drawPath(path, MetricGood, style = Stroke(width = 2.dp.toPx()))
+                }
             }
-            Text("Baseline: 2000mW", fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
         }
     }
 }
 
 @Composable
-private fun TokenTimeChart() {
-    // 模拟 token 时间分布 (瀑布图)
-    val tokenTimes = listOf(350f, 45f, 52f, 48f, 55f, 42f, 60f, 47f, 51f, 44f,
-                            53f, 49f, 46f, 58f, 43f, 50f)
+private fun TokenTimeChart(ttftMs: Float, itlSeries: List<Double>) {
+    // 首柱 = TTFT，其余 = 每个 token 的 ITL（真实数据）
+    val bars = remember(ttftMs, itlSeries) {
+        buildList { add(ttftMs.toDouble()); addAll(itlSeries) }
+    }
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text("Token Latency Waterfall", style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold)
-            Text("First bar = TTFT, rest = ITL", fontSize = 12.sp,
+            Text("首柱 = TTFT · 其后每柱 = 单 token ITL（共 ${itlSeries.size} 个）",
+                fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
             Spacer(modifier = Modifier.height(8.dp))
 
-            Canvas(modifier = Modifier.fillMaxWidth().height(100.dp)) {
-                val maxVal = tokenTimes.max()
-                val barWidth = size.width / tokenTimes.size * 0.8f
-                val gap = size.width / tokenTimes.size * 0.2f
+            if (bars.size < 2 || bars.max() <= 0.0) {
+                Text("暂无生成数据",
+                    modifier = Modifier.fillMaxWidth().height(100.dp),
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f))
+            } else {
+                Canvas(modifier = Modifier.fillMaxWidth().height(100.dp)) {
+                    val maxVal = bars.max().toFloat()
+                    val slot = size.width / bars.size
+                    val barWidth = slot * 0.8f
+                    val gap = slot * 0.2f
 
-                tokenTimes.forEachIndexed { index, value ->
-                    val x = index * (barWidth + gap)
-                    val height = (value / maxVal) * size.height
-                    val color = if (index == 0) Accent else MetricGood
+                    bars.forEachIndexed { index, value ->
+                        val v = value.toFloat()
+                        val x = index * slot
+                        val height = (v / maxVal) * size.height
+                        val color = if (index == 0) Accent else MetricGood
 
-                    drawRect(
-                        color = color,
-                        topLeft = Offset(x, size.height - height),
-                        size = androidx.compose.ui.geometry.Size(barWidth, height)
-                    )
+                        drawRect(
+                            color = color,
+                            topLeft = Offset(x, size.height - height),
+                            size = androidx.compose.ui.geometry.Size(barWidth, height)
+                        )
+                    }
                 }
             }
         }
