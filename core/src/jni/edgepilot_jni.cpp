@@ -185,6 +185,10 @@ Java_com_edgepilot_native_NativeEngine_nativeGenerateStream(
     jstring jres = env->NewStringUTF(json.c_str());
     env->CallVoidMethod(lref, onDone, jres);
     env->DeleteLocalRef(jres);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
     env->DeleteGlobalRef(lref);
 }
 
