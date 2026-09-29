@@ -17,6 +17,8 @@
 - **模型加载** — 支持 GGUF 格式模型（TinyLlama 等），自动适配量化方案
 - **文本生成** — 流式逐 token 输出（打字机），支持中途停止；同步 API 供基准测试使用
 - **性能指标** — 逐 token 采集 TTFT、ITL（Avg/P50/P90/P99）、吞吐量，全部来自真实推理
+- 真机基线矩阵 — 线程数 × 短/中/长 prompt 一键跑完，功耗(tokens/Joule)/温度节流/内存分解逐 cell 导出 CSV+JSON
+- sysfs 资源采集 — 电流×电压积分、thermal_zone 温度、Pss/VmRSS 内存，能力自检矩阵驱动 UI 徽标，不可用通道诚实留空
 - **KV Cache 管理** — 支持导出、导入、压缩 KV Cache
 
 ## 技术架构
@@ -46,6 +48,7 @@
 |---|---|
 | UI | Jetpack Compose + Material 3 |
 | 调试日志 | 编译期宏 `EP_LOGGING`（默认裁剪，`-PepLogging=true` 开启） |
+| 资源采集 | `/sys/class/power_supply`(电流×电压) · `thermal_zone*` · `/proc/self/smaps_rollup` — 免权限纯 sysfs，10Hz 采样 |
 | 状态管理 | ViewModel + StateFlow |
 | 原生桥接 | JNI (C++ ↔ Kotlin) |
 | 推理引擎 | llama.cpp (静态链接) |
@@ -118,6 +121,7 @@ EdgePilot/
 2. 输入模型路径，点击 **加载模型**
 3. 输入 Prompt，点击 **开始推理**
 4. 切换到 **指标 Tab** 查看性能数据
+5. 基线 Tab：确认能力徽标 → 选线程集 → 跑完整矩阵 → 按界面提示 `adb pull` 导出目录取 CSV/JSON
 
 ## 性能说明
 

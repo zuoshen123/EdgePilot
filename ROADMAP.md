@@ -43,6 +43,8 @@ v0.1 链路打通 → v0.2 数据可信 → v0.3 真机基线 → v0.4/0.5 优�
 
 **验收标准**：产出真机性能报告（prompt 长度 × 线程数 的 TTFT/ITL/功耗矩阵）。
 
+> 🚧 代码实施完成（基线矩阵/sysfs 采集/校验脚本/挂账清理），待真机验收：验收标准 1-6 见 `docs/superpowers/specs/2026-09-29-v0.3-real-baseline-design.md`。
+
 ---
 
 ## v0.4 — KV Cache 与 Prompt Cache 优化
