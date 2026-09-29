@@ -41,6 +41,7 @@ set(EDGEPILOT_SOURCES
     src/cache/prompt_cache.cpp
     src/scheduler/agent_scheduler.cpp
     src/metrics/metrics_collector.cpp
+    src/platform/platform_sampler.cpp
 )
 
 # ============================================================
