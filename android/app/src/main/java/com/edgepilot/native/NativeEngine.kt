@@ -1,6 +1,7 @@
 package com.edgepilot.native
 
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -16,7 +17,12 @@ data class GenerateOutput(
     val totalTokens: Int = 0,
     val tokensPerSec: Float = 0f,
     val ttftMs: Float = 0f,
-    val totalTimeMs: Float = 0f
+    val totalTimeMs: Float = 0f,
+    val itlAvgMs: Float = 0f,
+    val itlP50Ms: Float = 0f,
+    val itlP90Ms: Float = 0f,
+    val itlP99Ms: Float = 0f,
+    val itlSeries: List<Double> = emptyList()
 )
 
 object NativeEngine {
@@ -100,27 +106,42 @@ object NativeEngine {
                 GenerateOutput(text = "[错误] 推理失败: ${e.message}")
             }
         } else {
-            // Mock 模式
+            // Mock 模式（native 库缺失时的兜底，输出文本带 [Mock] 标记可辨识）
             Log.i(TAG, "[Mock] 生成: prompt=${prompt.take(50)}...")
+            val n = 20
+            val per = 1400.0 / n
             GenerateOutput(
                 text = "[Mock 模式] 这是 EdgePilot 的模拟回复。\n\n原始 prompt: ${prompt.take(100)}...",
-                totalTokens = 20,
-                tokensPerSec = 15.0f,
+                totalTokens = n,
+                tokensPerSec = n / 1.4f,
                 ttftMs = 120f,
-                totalTimeMs = 1400f
+                totalTimeMs = 1400f,
+                itlAvgMs = per.toFloat(),
+                itlP50Ms = per.toFloat(),
+                itlP90Ms = (per * 1.1).toFloat(),
+                itlP99Ms = (per * 1.2).toFloat(),
+                itlSeries = List(n - 1) { per }
             )
         }
     }
 
-    private fun parseGenerateOutput(json: String): GenerateOutput {
+    fun parseGenerateOutput(json: String): GenerateOutput {
         return try {
             val obj = JSONObject(json)
+            val seriesArr = obj.optJSONArray("itl_series") ?: JSONArray()
+            val series = ArrayList<Double>(seriesArr.length())
+            for (i in 0 until seriesArr.length()) series.add(seriesArr.getDouble(i))
             GenerateOutput(
                 text = obj.optString("text", ""),
                 totalTokens = obj.optInt("total_tokens", 0),
                 tokensPerSec = obj.optDouble("tokens_per_sec", 0.0).toFloat(),
                 ttftMs = obj.optDouble("ttft_ms", 0.0).toFloat(),
-                totalTimeMs = obj.optDouble("total_time_ms", 0.0).toFloat()
+                totalTimeMs = obj.optDouble("total_time_ms", 0.0).toFloat(),
+                itlAvgMs = obj.optDouble("itl_avg_ms", 0.0).toFloat(),
+                itlP50Ms = obj.optDouble("itl_p50_ms", 0.0).toFloat(),
+                itlP90Ms = obj.optDouble("itl_p90_ms", 0.0).toFloat(),
+                itlP99Ms = obj.optDouble("itl_p99_ms", 0.0).toFloat(),
+                itlSeries = series
             )
         } catch (e: Exception) {
             Log.e(TAG, "解析 JSON 失败: $json", e)
@@ -160,25 +181,6 @@ object NativeEngine {
             } catch (e: Exception) {
                 Log.e(TAG, "release 失败: ${e.message}")
             }
-        }
-    }
-
-    /**
-     * 获取当前推理接受率 (用于 speculative decoding)
-     */
-    fun getAcceptanceRate(): Float {
-        return if (nativeAvailable) {
-            // 从指标中解析
-            try {
-                val metricsJson = nativeGetMetrics()
-                // 简单解析 acceptance_rate 字段
-                val regex = """"acceptance_rate"\s*:\s*([\d.]+)""".toRegex()
-                regex.find(metricsJson)?.groupValues?.get(1)?.toFloatOrNull() ?: 0.7f
-            } catch (e: Exception) {
-                0.7f
-            }
-        } else {
-            0.68f // Mock 接受率
         }
     }
 }

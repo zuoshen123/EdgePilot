@@ -13,11 +13,14 @@ import kotlinx.coroutines.withContext
 data class BenchmarkResult(
     val ttftMs: Float = 0f,
     val itlAvgMs: Float = 0f,
+    val itlP50Ms: Float = 0f,
+    val itlP90Ms: Float = 0f,
     val itlP99Ms: Float = 0f,
     val tokensPerSec: Float = 0f,
     val totalTokens: Int = 0,
     val totalTimeMs: Float = 0f,
-    val acceptanceRate: Float = 0f
+    val itlSeries: List<Double> = emptyList(),
+    val acceptanceRate: Float = 0f  // 恒 0：无推测解码时不展示（UI 按 >0 隐藏），v0.5 接真实统计
 )
 
 data class BenchmarkUiState(
@@ -97,20 +100,24 @@ class BenchmarkViewModel : ViewModel() {
                     NativeEngine.generate(prompt, maxTokens)
                 }
 
-                // 计算平均 ITL
-                val itlAvg = if (output.totalTokens > 1)
-                    (output.totalTimeMs - output.ttftMs) / (output.totalTokens - 1) else 0f
+                // 运行时自检：ITL 序列长度必须 = totalTokens - 1
+                val expected = (output.totalTokens - 1).coerceAtLeast(0)
+                if (output.itlSeries.size != expected)
+                    addLog("警告: ITL序列 ${output.itlSeries.size} != 预期 $expected")
 
                 uiState = uiState.copy(
                     isRunning = false,
                     generatedText = output.text,
                     result = BenchmarkResult(
                         ttftMs = output.ttftMs,
-                        itlAvgMs = itlAvg,
-                        itlP99Ms = itlAvg * 1.2f,  // 简单估算 P99
+                        itlAvgMs = output.itlAvgMs,
+                        itlP50Ms = output.itlP50Ms,
+                        itlP90Ms = output.itlP90Ms,
+                        itlP99Ms = output.itlP99Ms,
                         totalTokens = output.totalTokens,
                         totalTimeMs = output.totalTimeMs,
-                        tokensPerSec = output.tokensPerSec
+                        tokensPerSec = output.tokensPerSec,
+                        itlSeries = output.itlSeries
                     )
                 )
                 addLog("推理完成: ${output.totalTokens} tokens, ${output.totalTimeMs.toInt()}ms, ${output.tokensPerSec} tok/s")

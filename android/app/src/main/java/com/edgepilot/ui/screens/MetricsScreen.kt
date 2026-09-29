@@ -54,7 +54,9 @@ fun MetricsScreen(
                     result.itlAvgMs < 100 -> MetricWarn
                     else -> MetricBad
                 },
-                description = "P99: ${String.format("%.1f", result.itlP99Ms)} ms"
+                description = "P50: ${String.format("%.1f", result.itlP50Ms)} ms · " +
+                    "P90: ${String.format("%.1f", result.itlP90Ms)} ms · " +
+                    "P99: ${String.format("%.1f", result.itlP99Ms)} ms"
             )
 
             // Tokens/sec 卡片
