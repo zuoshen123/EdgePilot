@@ -288,6 +288,9 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
 
     auto prompt_tokens = impl_->tokenize(request.prompt, true);
     if (prompt_tokens.empty()) {
+        run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
+        compute_itl_metrics(run, token_times);
+        impl_->last_metrics = run;  // 失败早退也定格本次(全零)指标，防 getLastMetrics 吐陈旧数据
         TokenResult tr{}; tr.is_eos = true;
         callback(tr);
         state_ = InferenceState::IDLE;
@@ -298,6 +301,9 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
                                             static_cast<int32_t>(prompt_tokens.size()));
     if (llama_decode(impl_->ctx, batch) != 0) {
+        run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
+        compute_itl_metrics(run, token_times);
+        impl_->last_metrics = run;  // 同上：prompt 超长致 prefill 失败时，onDone 报本次全零而非上次结果
         TokenResult tr{}; tr.is_eos = true;
         callback(tr);
         state_ = InferenceState::IDLE;
