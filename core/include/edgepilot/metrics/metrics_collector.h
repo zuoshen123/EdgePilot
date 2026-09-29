@@ -126,6 +126,17 @@ public:
     /// 获取所有历史记录
     std::vector<InferenceRecord> getHistory() const;
 
+    // ---- v0.3 平台资源采样窗口 (spec §②) ----
+
+    /// 能力矩阵 JSON（隐式懒 probe，幂等）
+    std::string samplerProbeJson();
+
+    /// 开采样窗口：隐式懒 probe、清空缓冲、置位
+    void beginWindow();
+
+    /// 关采样窗口并导出三通道时间线 JSON（见 spec §②）
+    std::string endWindowJson();
+
     /// 计算 ITL 统计
     static ITLStats calculateITLStats(const std::vector<float>& samples);
 

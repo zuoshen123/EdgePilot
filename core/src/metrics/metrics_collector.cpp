@@ -1,10 +1,27 @@
 #include "edgepilot/metrics/metrics_collector.h"
+#include "edgepilot/platform/platform_sampler.h"
 #include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <iomanip>
 #include <numeric>
 #include <unordered_map>
 #include <sstream>
 
 namespace edgepilot {
+
+namespace {
+// JSON 安全字符串：仅保留内核目录/类型名的合法字符集（spec §②：zones/power_path 来自 sysfs）
+std::string json_sanitize(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (std::isalnum(u) || c=='-' || c=='_' || c=='.') out += c;
+    }
+    return out;
+}
+} // namespace
 
 // ============================================================
 // MetricsCollector 实现
@@ -21,12 +38,46 @@ struct MetricsCollector::Impl {
 
     MetricsCallback metrics_callback;
 
+    // ---- v0.3 采样窗口 (spec §②) ----
+    static constexpr size_t kMaxWinSamples = 20000;   // 每通道上限 ≈33min@10Hz，越界丢最旧
+    PlatformSampler sampler;
+    bool sampler_probed = false;
+    std::mutex win_mtx;                                // 独立于 mutex：避免与记录锁交叉
+    bool window_open = false;
+    std::vector<PowerSample> win_power;
+    std::vector<ThermalSample> win_thermal;
+    std::vector<MemSample> win_mem;
+
+    void ensureProbed() {   // 调用方持 win_mtx
+        if (!sampler_probed) { sampler.probe(); sampler_probed = true; }
+    }
+
     /// 后台采集线程
     void collectionLoop() {
         while (running.load()) {
-            // 采集系统级指标 (CPU/GPU/内存/温度)
-            // TODO: 从平台 API 读取
-
+            bool open;
+            { std::lock_guard<std::mutex> lk(win_mtx); open = window_open; }
+            if (open) {
+                PowerSample ps; ThermalSample ts; MemSample ms;
+                const bool rp = sampler.readPower(ps);
+                const bool rt = sampler.readThermal(ts);
+                const bool rm = sampler.readMem(ms);
+                std::lock_guard<std::mutex> lk(win_mtx);
+                if (window_open) {   // 二次确认：endWindow 可能在三读之间发生
+                    if (rp) {
+                        if (win_power.size() >= kMaxWinSamples) win_power.erase(win_power.begin());
+                        win_power.push_back(ps);
+                    }
+                    if (rt) {
+                        if (win_thermal.size() >= kMaxWinSamples) win_thermal.erase(win_thermal.begin());
+                        win_thermal.push_back(ts);
+                    }
+                    if (rm) {
+                        if (win_mem.size() >= kMaxWinSamples) win_mem.erase(win_mem.begin());
+                        win_mem.push_back(ms);
+                    }
+                }
+            }
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(config.sample_interval_ms));
         }
@@ -42,6 +93,8 @@ MetricsCollector::~MetricsCollector() {
 
 Status MetricsCollector::initialize(const Config& config) {
     impl_->config = config;
+    if (impl_->config.sample_interval_ms <= 0) impl_->config.sample_interval_ms = 100;
+    if (impl_->config.max_history_size <= 0)   impl_->config.max_history_size = 100;
     return Status::OK;
 }
 
@@ -212,6 +265,63 @@ void MetricsCollector::exportToSQLite(const std::string& path) const {
 void MetricsCollector::exportToCSV(const std::string& path) const {
     // TODO: 写入 CSV
     (void)path;
+}
+
+std::string MetricsCollector::samplerProbeJson() {
+    std::lock_guard<std::mutex> lk(impl_->win_mtx);
+    impl_->ensureProbed();
+    const Capability& cap = impl_->sampler.capability();
+    std::string j = "{\"power\":\"";      j += samplerStatusToString(cap.power);
+    j += "\",\"thermal\":\"";             j += samplerStatusToString(cap.thermal);
+    j += "\",\"mem\":\"";                 j += samplerStatusToString(cap.mem);
+    j += "\",\"cpu\":\"";                 j += samplerStatusToString(cap.cpu);
+    j += "\",\"power_path\":\"";          j += json_sanitize(cap.power_path);
+    j += "\",\"zones\":[";
+    for (size_t i = 0; i < cap.cpu_zone_types.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + json_sanitize(cap.cpu_zone_types[i]) + "\"";
+    }
+    j += "]}";
+    return j;
+}
+
+void MetricsCollector::beginWindow() {
+    std::lock_guard<std::mutex> lk(impl_->win_mtx);
+    impl_->ensureProbed();
+    impl_->win_power.clear();
+    impl_->win_thermal.clear();
+    impl_->win_mem.clear();
+    impl_->window_open = true;
+}
+
+std::string MetricsCollector::endWindowJson() {
+    std::lock_guard<std::mutex> lk(impl_->win_mtx);
+    impl_->window_open = false;
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(3);
+    o << "{\"power\":[";
+    for (size_t i = 0; i < impl_->win_power.size(); ++i) {
+        if (i) o << ",";
+        o << "[" << impl_->win_power[i].t_ms << "," << impl_->win_power[i].power_mw << "]";
+    }
+    o << "],\"thermal\":[";
+    for (size_t i = 0; i < impl_->win_thermal.size(); ++i) {
+        if (i) o << ",";
+        o << "[" << impl_->win_thermal[i].t_ms << "," << impl_->win_thermal[i].cpu_max_c << "]";
+    }
+    o << "],\"mem\":[";
+    for (size_t i = 0; i < impl_->win_mem.size(); ++i) {
+        if (i) o << ",";
+        o << "[" << impl_->win_mem[i].t_ms << "," << impl_->win_mem[i].pss_kb
+          << "," << impl_->win_mem[i].vmrss_kb << "]";
+    }
+    o << "],\"n\":{\"power\":" << impl_->win_power.size()
+      << ",\"thermal\":" << impl_->win_thermal.size()
+      << ",\"mem\":" << impl_->win_mem.size() << "}}";
+    impl_->win_power.clear();
+    impl_->win_thermal.clear();
+    impl_->win_mem.clear();
+    return o.str();
 }
 
 void MetricsCollector::setMetricsCallback(MetricsCallback callback) {
