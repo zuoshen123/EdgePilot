@@ -71,18 +71,26 @@ class BenchmarkViewModel : ViewModel() {
                     uiState = uiState.copy(modelLoaded = true, isRunning = false)
                     addLog("模型加载成功")
                 } else {
+                    // 加载失败时 native 引擎必不可用（守卫已 reset）——旗标不许撒谎（I-1c）
                     uiState = uiState.copy(
+                        modelLoaded = false,
                         error = "模型加载失败",
                         isRunning = false
                     )
                 }
             } catch (e: Exception) {
                 uiState = uiState.copy(
+                    modelLoaded = false,
                     error = "异常: ${e.message}",
                     isRunning = false
                 )
             }
         }
+    }
+
+    /** 引擎被外部释放（矩阵收尾）：重置加载旗标，单跑强制走全新加载=推荐配置（I-2 握手机制） */
+    fun onEngineReleased() {
+        uiState = uiState.copy(modelLoaded = false)
     }
 
     fun runBenchmark(prompt: String, maxTokens: Int = 128) {

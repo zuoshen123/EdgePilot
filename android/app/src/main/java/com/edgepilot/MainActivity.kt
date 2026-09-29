@@ -84,7 +84,7 @@ fun MainApp(viewModel: BenchmarkViewModel = viewModel()) {
                     result = viewModel.uiState.result,
                     metricsJson = ""
                 )
-                2 -> BaselineScreen()
+                2 -> BaselineScreen(onEngineReleased = { viewModel.onEngineReleased() })
             }
         }
     }

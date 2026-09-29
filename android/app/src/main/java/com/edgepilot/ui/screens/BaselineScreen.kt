@@ -26,7 +26,7 @@ import org.json.JSONObject
 import java.util.Locale
 
 @Composable
-fun BaselineScreen() {
+fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
     val context = LocalContext.current
     val runner = remember { BenchmarkSuiteRunner(context.applicationContext) }
     val scope = rememberCoroutineScope()
@@ -94,7 +94,7 @@ fun BaselineScreen() {
         Button(
             onClick = {
                 if (running) return@Button
-                val mt = maxTokensText.toIntOrNull() ?: 128
+                val mt = (maxTokensText.toIntOrNull() ?: 128).coerceAtLeast(1)
                 val ths = threadsSel.sorted()
                 running = true
                 cells = emptyList()
@@ -113,6 +113,10 @@ fun BaselineScreen() {
                     } catch (e: Exception) {
                         logs = logs + "矩阵异常中止: ${e.message}"
                     } finally {
+                        // I-2：矩阵末列线程集不属于单跑的"推荐配置"归属——交还引擎所有权
+                        NativeEngine.release()
+                        onEngineReleased()
+                        logs = logs + "矩阵结束：引擎已释放，单跑前请回测试 Tab 重新加载模型"
                         running = false
                     }
                 }

@@ -134,6 +134,7 @@ Java_com_edgepilot_native_NativeEngine_nativeInit(
         return JNI_TRUE;
     } catch (const std::exception& e) {
         EP_LOGE("异常: %s", e.what());
+        g_backend.reset();  // 不留"半构造"后端（M-3）；生成守卫由此走 g_backend==null → 显式异常
         return JNI_FALSE;
     }
 }
@@ -184,6 +185,9 @@ Java_com_edgepilot_native_NativeEngine_nativeGenerateStream(
 {
     if (!g_initialized || !g_backend || !listener) {
         EP_LOGE("nativeGenerateStream: 未初始化或 listener 为空");
+        // 静默返回会让 Kotlin 侧 ok=true 且 onDone 零达（await 永久楔死）——挂起异常使 ok=false
+        jclass guard_exc = env->FindClass("java/lang/IllegalStateException");
+        if (guard_exc) env->ThrowNew(guard_exc, "engine not initialized");
         return;
     }
 
