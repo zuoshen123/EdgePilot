@@ -12,9 +12,10 @@
 #include <thread>
 #include <vector>
 
+#include "edgepilot/common/log.h"
+
 #ifdef __ANDROID__
 #include <sys/sysinfo.h>
-#include <android/log.h>
 #endif
 
 namespace edgepilot {
@@ -117,9 +118,7 @@ Status GgmlBackend::loadModel(const ModelConfig& config) {
     }
 
     impl_->vocab = llama_model_get_vocab(impl_->model);
-#ifdef __ANDROID__
-    __android_log_print(ANDROID_LOG_INFO, "EP", "vocab=%p", (void*)impl_->vocab);
-#endif
+    EP_LOGI("vocab=%p", (void*)impl_->vocab);
 
     auto cparams = llama_context_default_params();
     cparams.n_ctx   = config.context_length > 0 ? config.context_length : 2048;
@@ -174,9 +173,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
 
     // Tokenize prompt
     auto prompt_tokens = impl_->tokenize(request.prompt, true);
-#ifdef __ANDROID__
-    __android_log_print(ANDROID_LOG_INFO, "EP", "tokenize: %d tokens", (int)prompt_tokens.size());
-#endif
+    EP_LOGI("tokenize: %d tokens", (int)prompt_tokens.size());
     if (prompt_tokens.empty()) {
         state_ = InferenceState::IDLE;
         return result;
@@ -187,9 +184,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
                                             static_cast<int32_t>(prompt_tokens.size()));
     int prefill_ret = llama_decode(impl_->ctx, batch);
-#ifdef __ANDROID__
-    __android_log_print(ANDROID_LOG_INFO, "EP", "prefill decode ret=%d", prefill_ret);
-#endif
+    EP_LOGI("prefill decode ret=%d", prefill_ret);
     if (prefill_ret != 0) {
         state_ = InferenceState::IDLE;
         return result;
@@ -204,9 +199,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
         if (impl_->cancelled) break;
 
         new_token_id = llama_sampler_sample(impl_->sampler, impl_->ctx, -1);
-#ifdef __ANDROID__
-        if (i < 3) __android_log_print(ANDROID_LOG_INFO, "EP", "sample[%d] id=%d eog=%d", i, new_token_id, llama_vocab_is_eog(impl_->vocab, new_token_id));
-#endif
+        if (i < 3) EP_LOGI("sample[%d] id=%d eog=%d", i, new_token_id, llama_vocab_is_eog(impl_->vocab, new_token_id));
         if (llama_vocab_is_eog(impl_->vocab, new_token_id)) break;
 
         if (i == 0) {

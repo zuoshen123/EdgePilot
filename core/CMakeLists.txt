@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ============================================================
+# 调试日志开关（默认 OFF，-DEP_LOGGING=ON 打开 D/I/W 级别）
+# ============================================================
+option(EP_LOGGING "enable verbose engine debug logging" OFF)
+
+# ============================================================
 # llama.cpp (子模块)
 # ============================================================
 set(LLAMA_STANDALONE OFF CACHE BOOL "" FORCE)
@@ -80,6 +85,13 @@ if(ANDROID)
     add_library(edgepilot_jni SHARED src/jni/edgepilot_jni.cpp)
     target_link_libraries(edgepilot_jni PRIVATE edgepilot_core)
     target_link_options(edgepilot_jni PRIVATE "LINKER:-z,max-page-size=16384")
+endif()
+
+if(EP_LOGGING)
+    target_compile_definitions(edgepilot_core PRIVATE EP_LOGGING)
+    if(TARGET edgepilot_jni)
+        target_compile_definitions(edgepilot_jni PRIVATE EP_LOGGING)
+    endif()
 endif()
 
 # ============================================================

@@ -32,6 +32,9 @@ android {
                     "-DLLAMA_BUILD_TESTS=OFF",
                     "-DLLAMA_BUILD_EXAMPLES=OFF"
                 )
+                if (project.findProperty("epLogging") == "true") {
+                    arguments += "-DEP_LOGGING=ON"
+                }
             }
         }
     }

@@ -1,13 +1,9 @@
 #include <jni.h>
 #include <string>
 #include <memory>
-#include <android/log.h>
 
 #include "edgepilot/backend/backend_factory.h"
-
-#define TAG "EdgePilot-JNI"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "edgepilot/common/log.h"
 
 using namespace edgepilot;
 
@@ -34,27 +30,27 @@ Java_com_edgepilot_native_NativeEngine_nativeInit(
 {
     if (g_initialized) return JNI_TRUE;
 
-    LOGI("nativeInit: 初始化 EdgePilot");
+    EP_LOGI("nativeInit: 初始化 EdgePilot");
     try {
         g_backend = BackendFactory::createOptimal();
-        if (!g_backend) { LOGE("创建后端失败"); return JNI_FALSE; }
+        if (!g_backend) { EP_LOGE("创建后端失败"); return JNI_FALSE; }
 
         HardwareInfo hw = BackendFactory::detectHardware();
         ModelConfig cfg = BackendFactory::getRecommendedConfig(hw);
         cfg.model_path = jstring_to_string(env, modelPath);
 
-        LOGI("加载模型: %s", cfg.model_path.c_str());
+        EP_LOGI("加载模型: %s", cfg.model_path.c_str());
         Status s = g_backend->loadModel(cfg);
         if (s != Status::OK) {
-            LOGE("模型加载失败: %s", statusToString(s));
+            EP_LOGE("模型加载失败: %s", statusToString(s));
             return JNI_FALSE;
         }
 
         g_initialized = true;
-        LOGI("初始化完成");
+        EP_LOGI("初始化完成");
         return JNI_TRUE;
     } catch (const std::exception& e) {
-        LOGE("异常: %s", e.what());
+        EP_LOGE("异常: %s", e.what());
         return JNI_FALSE;
     }
 }
@@ -82,7 +78,7 @@ Java_com_edgepilot_native_NativeEngine_nativeGenerate(
         return string_to_jstring(env, "[错误] 未初始化");
 
     std::string p = jstring_to_string(env, prompt);
-    LOGI("生成: '%s', max=%d", p.c_str(), maxTokens);
+    EP_LOGI("生成: '%s', max=%d", p.c_str(), maxTokens);
 
     GenerateRequest req{};
     req.prompt = p;
@@ -93,7 +89,7 @@ Java_com_edgepilot_native_NativeEngine_nativeGenerate(
 
     GenerateResult res = g_backend->generate(req);
 
-    LOGI("完成: %d tokens, %.1f tok/s, TTFT=%.1fms",
+    EP_LOGI("完成: %d tokens, %.1f tok/s, TTFT=%.1fms",
          res.total_tokens, res.tokens_per_sec, res.ttft_ms);
 
     // 返回 JSON：包含文本和指标
@@ -131,7 +127,7 @@ Java_com_edgepilot_native_NativeEngine_nativeGetMetrics(JNIEnv* env, jobject)
 JNIEXPORT void JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeRelease(JNIEnv*, jobject)
 {
-    LOGI("释放引擎");
+    EP_LOGI("释放引擎");
     if (g_backend) { g_backend->unload(); g_backend.reset(); }
     g_initialized = false;
 }
