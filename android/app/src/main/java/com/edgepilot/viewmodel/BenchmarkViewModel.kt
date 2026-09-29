@@ -5,7 +5,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.edgepilot.harness.SamplerWindow
 import com.edgepilot.native.NativeEngine
+import java.util.Locale
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -20,6 +23,8 @@ data class BenchmarkResult(
     val totalTokens: Int = 0,
     val totalTimeMs: Float = 0f,
     val itlSeries: List<Double> = emptyList(),
+    val powerTimeline: List<Float> = emptyList(),   // 单跑窗口功耗曲线（mW，10Hz；空=无数据）
+    val energyMj: Float = 0f,                       // 窗口能量积分（mJ）
     val acceptanceRate: Float = 0f  // 恒 0：无推测解码时不展示（UI 按 >0 隐藏），v0.5 接真实统计
 )
 
@@ -96,46 +101,62 @@ class BenchmarkViewModel : ViewModel() {
         )
         addLog("流式推理开始: prompt=${prompt.take(40)}…, maxTokens=$maxTokens")
 
-        val listener = object : NativeEngine.StreamListener {
-            override fun onToken(piece: String, tokenId: Int) {
-                viewModelScope.launch(Dispatchers.Main) {
-                    uiState = uiState.copy(generatedText = uiState.generatedText + piece)
-                }
-            }
-
-            override fun onDone(resultJson: String) {
-                val output = NativeEngine.parseGenerateOutput(resultJson)
-                viewModelScope.launch(Dispatchers.Main) {
-                    val expected = (output.totalTokens - 1).coerceAtLeast(0)
-                    if (output.itlSeries.size != expected)
-                        addLog("警告: ITL序列 ${output.itlSeries.size} != 预期 $expected")
-                    uiState = uiState.copy(
-                        isRunning = false,
-                        result = BenchmarkResult(
-                            ttftMs = output.ttftMs,
-                            itlAvgMs = output.itlAvgMs,
-                            itlP50Ms = output.itlP50Ms,
-                            itlP90Ms = output.itlP90Ms,
-                            itlP99Ms = output.itlP99Ms,
-                            tokensPerSec = output.tokensPerSec,
-                            totalTokens = output.totalTokens,
-                            totalTimeMs = output.totalTimeMs,
-                            itlSeries = output.itlSeries
-                        )
-                    )
-                    addLog("推理完成: ${output.totalTokens} tokens, ${output.totalTimeMs.toInt()}ms, " +
-                        "TTFT ${output.ttftMs.toInt()}ms, ${String.format("%.1f", output.tokensPerSec)} tok/s")
-                }
-            }
-        }
-
         viewModelScope.launch {
+            val done = CompletableDeferred<String?>()
+            val listener = object : NativeEngine.StreamListener {
+                override fun onToken(piece: String, tokenId: Int) {
+                    viewModelScope.launch(Dispatchers.Main) {
+                        uiState = uiState.copy(generatedText = uiState.generatedText + piece)
+                    }
+                }
+
+                override fun onDone(resultJson: String) {
+                    if (!done.isCompleted) done.complete(resultJson)
+                }
+            }
+
+            NativeEngine.samplerBegin()
             val started = withContext(Dispatchers.Default) {
                 NativeEngine.generateStream(prompt, maxTokens, listener)
             }
+            val windowJson = NativeEngine.samplerEnd()  // native 路径 onDone 先于返回，窗口已含全程
             if (!started) {
                 uiState = uiState.copy(isRunning = false, error = "流式推理启动失败")
+                return@launch
             }
+            val resultJson = done.await()  // started ⇒ onDone 必达（native 收尾保证；Mock 见 R7）
+
+            val output = NativeEngine.parseGenerateOutput(resultJson ?: "{}")
+            // N4：prefill 失败 → 显式错误，绝不以 0 值假成功上屏
+            if (output.totalTokens == 0 && output.text.startsWith("[错误]")) {
+                uiState = uiState.copy(isRunning = false, error = output.text)
+                addLog("推理失败: ${output.text}")
+                return@launch
+            }
+
+            val agg = SamplerWindow.parse(windowJson)
+            val expected = (output.totalTokens - 1).coerceAtLeast(0)
+            if (output.itlSeries.size != expected)
+                addLog("警告: ITL序列 ${output.itlSeries.size} != 预期 $expected")
+            uiState = uiState.copy(
+                isRunning = false,
+                result = BenchmarkResult(
+                    ttftMs = output.ttftMs,
+                    itlAvgMs = output.itlAvgMs,
+                    itlP50Ms = output.itlP50Ms,
+                    itlP90Ms = output.itlP90Ms,
+                    itlP99Ms = output.itlP99Ms,
+                    tokensPerSec = output.tokensPerSec,
+                    totalTokens = output.totalTokens,
+                    totalTimeMs = output.totalTimeMs,
+                    itlSeries = output.itlSeries,
+                    powerTimeline = agg.powerMw,
+                    energyMj = agg.energyMJ.toFloat()
+                )
+            )
+            addLog("推理完成: ${output.totalTokens} tokens, ${output.totalTimeMs.toInt()}ms, " +
+                "TTFT ${output.ttftMs.toInt()}ms, ${String.format("%.1f", output.tokensPerSec)} tok/s" +
+                " · 功耗采样 ${agg.nPower} 点, ${String.format(Locale.US, "%.2f", agg.energyMJ / 1000.0)}J")
         }
     }
 
