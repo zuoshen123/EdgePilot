@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -20,6 +21,9 @@
 #endif
 
 namespace edgepilot {
+
+// 流式/同步早退共用：失败必须让用户看见（N4，spec §⑤）
+static constexpr const char* kPrefillError = "[错误] prefill 失败（可能超出上下文）";
 
 // nearest-rank 分位数：idx = ceil(q*n) - 1（升序数组）
 static double percentile_nearest_rank(const std::vector<double>& sorted, double q) {
@@ -66,7 +70,7 @@ struct GgmlBackend::Impl {
 
     // ---- 生成状态 ----
     std::mutex  mtx;
-    bool        cancelled = false;
+    std::atomic<bool> cancelled{false};
     int32_t     n_past    = 0;    // KV cache 中已有的 token 数
 
     // ---- 指标 ----
@@ -208,6 +212,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     auto prompt_tokens = impl_->tokenize(request.prompt, true);
     EP_LOGI("tokenize: %d tokens", (int)prompt_tokens.size());
     if (prompt_tokens.empty()) {
+        result.generated_text = kPrefillError;
         state_ = InferenceState::IDLE;
         return result;
     }
@@ -219,6 +224,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     int prefill_ret = llama_decode(impl_->ctx, batch);
     EP_LOGI("prefill decode ret=%d", prefill_ret);
     if (prefill_ret != 0) {
+        result.generated_text = kPrefillError;
         state_ = InferenceState::IDLE;
         return result;
     }
@@ -288,6 +294,7 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
 
     auto prompt_tokens = impl_->tokenize(request.prompt, true);
     if (prompt_tokens.empty()) {
+        run.generated_text = kPrefillError;
         run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
         compute_itl_metrics(run, token_times);
         impl_->last_metrics = run;  // 失败早退也定格本次(全零)指标，防 getLastMetrics 吐陈旧数据
@@ -301,6 +308,7 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
                                             static_cast<int32_t>(prompt_tokens.size()));
     if (llama_decode(impl_->ctx, batch) != 0) {
+        run.generated_text = kPrefillError;
         run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
         compute_itl_metrics(run, token_times);
         impl_->last_metrics = run;  // 同上：prompt 超长致 prefill 失败时，onDone 报本次全零而非上次结果
@@ -480,10 +488,20 @@ HardwareInfo GgmlBackend::getHardwareInfo() const {
 
 KVCacheInfo GgmlBackend::getKVCacheInfo() const {
     KVCacheInfo info{};
-    if (impl_->ctx) {
+    if (impl_->ctx && impl_->model) {
         info.max_seq_len = static_cast<int>(llama_n_ctx(impl_->ctx));
-        info.used_memory_bytes = impl_->n_past * 1024;  // 估算
-        info.num_layers = impl_->model ? llama_model_n_layer(impl_->model) : 0;
+        info.num_layers  = static_cast<int>(llama_model_n_layer(impl_->model));
+        const int n_head     = static_cast<int>(llama_model_n_head(impl_->model));
+        const int n_head_kv  = static_cast<int>(llama_model_n_head_kv(impl_->model));
+        const int n_embd     = static_cast<int>(llama_model_n_embd(impl_->model));
+        info.num_heads = n_head;
+        info.head_dim  = n_head > 0 ? n_embd / n_head : 0;
+        // K+V × 层 × kv头 × head_dim × F16(2B)；默认缓存类型 F16（cparams 未显式量化）
+        const size_t per_tok = 2ULL * static_cast<size_t>(info.num_layers)
+                               * static_cast<size_t>(n_head_kv > 0 ? n_head_kv : n_head)
+                               * static_cast<size_t>(info.head_dim) * 2ULL;
+        info.used_memory_bytes  = static_cast<size_t>(impl_->n_past) * per_tok;
+        info.total_memory_bytes = static_cast<size_t>(info.max_seq_len) * per_tok;
     }
     return info;
 }
