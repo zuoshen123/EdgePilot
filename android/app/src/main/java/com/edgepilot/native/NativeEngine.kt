@@ -43,7 +43,7 @@ object NativeEngine {
     }
 
     // ---- Native 方法声明 ----
-    external fun nativeInit(modelPath: String): Boolean
+    external fun nativeInit(modelPath: String, threads: Int): Boolean
     external fun nativeGetHardwareInfo(): String
     external fun nativeGenerate(prompt: String, maxTokens: Int): String
 
@@ -56,26 +56,37 @@ object NativeEngine {
     external fun nativeGenerateStream(prompt: String, maxTokens: Int, listener: Any)
     external fun nativeCancel()
 
+    external fun nativeSamplerProbe(): String
+    external fun nativeSamplerBegin()
+    external fun nativeSamplerEnd(): String
     external fun nativeGetMetrics(): String
     external fun nativeRelease()
 
     // ---- Kotlin 包装 (带 Mock 回退) ----
 
+    // N2: 生成在途时的延后释放（onCleared 不得在 native 生成线程使用引擎期间 reset 后端）
+    @Volatile private var generating = false
+    @Volatile private var releasePending = false
+
+    private const val MOCK_CAPABILITY_JSON =
+        """{"power":"ABSENT","thermal":"ABSENT","mem":"ABSENT","cpu":"ABSENT","power_path":"","zones":[]}"""
+    private const val EMPTY_WINDOW_JSON =
+        """{"power":[],"thermal":[],"mem":[],"n":{"power":0,"thermal":0,"mem":0}}"""
+
     /**
-     * 初始化引擎
-     * @param modelPath 模型文件路径 (如 /sdcard/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf)
-     * @return 是否初始化成功
+     * 初始化/重载引擎。同路径同线程数时快速复用（native 侧判断）。
+     * @param threads CPU 线程数，<=0 用推荐配置
      */
-    fun init(modelPath: String): Boolean {
+    fun init(modelPath: String, threads: Int = 0): Boolean {
         return if (nativeAvailable) {
             try {
-                nativeInit(modelPath)
+                nativeInit(modelPath, threads)
             } catch (e: Exception) {
                 Log.e(TAG, "nativeInit 失败: ${e.message}")
                 false
             }
         } else {
-            Log.i(TAG, "[Mock] 初始化: $modelPath")
+            Log.i(TAG, "[Mock] 初始化: $modelPath (threads=$threads)")
             true
         }
     }
@@ -108,13 +119,19 @@ object NativeEngine {
      */
     fun generate(prompt: String, maxTokens: Int = 256): GenerateOutput {
         return if (nativeAvailable) {
+            var ok: GenerateOutput
+            generating = true
             try {
                 val json = nativeGenerate(prompt, maxTokens)
-                parseGenerateOutput(json)
+                ok = parseGenerateOutput(json)
             } catch (e: Exception) {
                 Log.e(TAG, "generate 失败: ${e.message}")
-                GenerateOutput(text = "[错误] 推理失败: ${e.message}")
+                ok = GenerateOutput(text = "[错误] 推理失败: ${e.message}")
+            } finally {
+                generating = false
+                drainPendingRelease()
             }
+            ok
         } else {
             // Mock 模式（native 库缺失时的兜底，输出文本带 [Mock] 标记可辨识）
             Log.i(TAG, "[Mock] 生成: prompt=${prompt.take(50)}...")
@@ -142,13 +159,18 @@ object NativeEngine {
      */
     fun generateStream(prompt: String, maxTokens: Int, listener: StreamListener): Boolean {
         return if (nativeAvailable) {
+            var ok = false
+            generating = true
             try {
                 nativeGenerateStream(prompt, maxTokens, listener)
-                true
+                ok = true
             } catch (e: Exception) {
                 Log.e(TAG, "generateStream 失败: ${e.message}", e)
-                false
+            } finally {
+                generating = false
+                drainPendingRelease()
             }
+            ok
         } else {
             // Mock 流式：逐词吐出，模拟打字机
             Thread {
@@ -221,15 +243,55 @@ object NativeEngine {
         }
     }
 
+    /** 能力矩阵 JSON（spec §②；Mock 环境全 ABSENT——不伪造） */
+    fun samplerProbe(): String {
+        return if (nativeAvailable) {
+            try { nativeSamplerProbe() } catch (e: Exception) {
+                Log.e(TAG, "samplerProbe 失败: ${e.message}"); MOCK_CAPABILITY_JSON
+            }
+        } else MOCK_CAPABILITY_JSON
+    }
+
+    fun samplerBegin() {
+        if (!nativeAvailable) return
+        try { nativeSamplerBegin() } catch (e: Exception) { Log.e(TAG, "samplerBegin 失败: ${e.message}") }
+    }
+
+    /** 关窗导出窗口时间线 JSON；异常返回空窗（调用方按"无数据"处理，不伪造） */
+    fun samplerEnd(): String {
+        return if (nativeAvailable) {
+            try { nativeSamplerEnd() } catch (e: Exception) {
+                Log.e(TAG, "samplerEnd 失败: ${e.message}"); EMPTY_WINDOW_JSON
+            }
+        } else EMPTY_WINDOW_JSON
+    }
+
     /**
-     * 释放资源
+     * 释放资源。生成在途时置 releasePending，由在途线程收尾时真正释放（N2）。
+     * 注：release 与"下一次生成开始"同线程（Main/Default 串行）时窗口闭合；
+     * 矩阵 runner 与 UI 单跑互斥使用引擎，不在 release 挂起时并发开新生成。
      */
     fun release() {
-        if (nativeAvailable) {
+        if (!nativeAvailable) return
+        if (generating) {
+            releasePending = true
+            Log.i(TAG, "release 延后至在途生成结束")
+            return
+        }
+        try {
+            nativeRelease()
+        } catch (e: Exception) {
+            Log.e(TAG, "release 失败: ${e.message}")
+        }
+    }
+
+    private fun drainPendingRelease() {
+        if (releasePending) {
+            releasePending = false
             try {
                 nativeRelease()
             } catch (e: Exception) {
-                Log.e(TAG, "release 失败: ${e.message}")
+                Log.e(TAG, "延后 release 失败: ${e.message}")
             }
         }
     }

@@ -6,11 +6,16 @@
 
 #include "edgepilot/backend/backend_factory.h"
 #include "edgepilot/common/log.h"
+#include "edgepilot/metrics/metrics_collector.h"
 
 using namespace edgepilot;
 
 static std::unique_ptr<InferenceBackend> g_backend;
 static bool g_initialized = false;
+static MetricsCollector g_metrics;         // v0.3 平台资源采样（spec §②）
+static bool g_metrics_started = false;
+static jint g_active_threads = 0;          // 上次成功加载所用的线程数
+static std::string g_model_path;           // 上次成功加载的模型路径
 
 static std::string jstring_to_string(JNIEnv* env, jstring jstr) {
     if (!jstr) return "";
@@ -76,27 +81,55 @@ extern "C" {
 
 JNIEXPORT jboolean JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeInit(
-    JNIEnv* env, jobject, jstring modelPath)
+    JNIEnv* env, jobject, jstring modelPath, jint threads)
 {
-    if (g_initialized) return JNI_TRUE;
+    std::string path = jstring_to_string(env, modelPath);
+    const bool same_path = (path == g_model_path);
+    const bool same_threads = (threads <= 0) ? (g_active_threads > 0)
+                                             : (threads == g_active_threads);
+    if (g_initialized && same_path && same_threads) {
+        return JNI_TRUE;  // 快速复用：矩阵换 prompt 不重载模型
+    }
+    if (g_initialized) {  // 换模型或换线程数：先卸再载（spec §②，矩阵逐线程列重载）
+        EP_LOGI("nativeInit: 重载 (path_same=%d threads %d->%d)",
+                same_path ? 1 : 0, g_active_threads, (int)threads);
+        if (g_backend) { g_backend->unload(); g_backend.reset(); }
+        g_initialized = false;
+    }
 
-    EP_LOGI("nativeInit: 初始化 EdgePilot");
+    EP_LOGI("nativeInit: 初始化 EdgePilot (threads=%d)", (int)threads);
     try {
         g_backend = BackendFactory::createOptimal();
         if (!g_backend) { EP_LOGE("创建后端失败"); return JNI_FALSE; }
 
         HardwareInfo hw = BackendFactory::detectHardware();
         ModelConfig cfg = BackendFactory::getRecommendedConfig(hw);
-        cfg.model_path = jstring_to_string(env, modelPath);
+        cfg.model_path = path;
+        if (threads > 0) cfg.threads = threads;
 
-        EP_LOGI("加载模型: %s", cfg.model_path.c_str());
+        EP_LOGI("加载模型: %s (threads=%d)", cfg.model_path.c_str(), cfg.threads);
         Status s = g_backend->loadModel(cfg);
         if (s != Status::OK) {
             EP_LOGE("模型加载失败: %s", statusToString(s));
+            g_backend.reset();
             return JNI_FALSE;
         }
 
+        g_active_threads = cfg.threads;
+        g_model_path = path;
         g_initialized = true;
+
+        if (!g_metrics_started) {  // 采集线程全程常驻（spec §②），幂等
+            MetricsCollector::Config mc{};
+            mc.sample_interval_ms = 100;
+            mc.enable_sqlite = false;
+            mc.db_path = "";
+            mc.enable_realtime_callback = false;
+            mc.max_history_size = 100;
+            g_metrics.initialize(mc);
+            g_metrics.start();
+            g_metrics_started = true;
+        }
         EP_LOGI("初始化完成");
         return JNI_TRUE;
     } catch (const std::exception& e) {
@@ -202,6 +235,24 @@ Java_com_edgepilot_native_NativeEngine_nativeCancel(JNIEnv*, jobject)
 }
 
 JNIEXPORT jstring JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeSamplerProbe(JNIEnv* env, jobject)
+{
+    return string_to_jstring(env, g_metrics.samplerProbeJson());
+}
+
+JNIEXPORT void JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeSamplerBegin(JNIEnv*, jobject)
+{
+    g_metrics.beginWindow();
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeSamplerEnd(JNIEnv* env, jobject)
+{
+    return string_to_jstring(env, g_metrics.endWindowJson());
+}
+
+JNIEXPORT jstring JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeGetMetrics(JNIEnv* env, jobject)
 {
     if (!g_backend) return string_to_jstring(env, "{}");
@@ -219,6 +270,8 @@ Java_com_edgepilot_native_NativeEngine_nativeRelease(JNIEnv*, jobject)
     EP_LOGI("释放引擎");
     if (g_backend) { g_backend->unload(); g_backend.reset(); }
     g_initialized = false;
+    g_model_path.clear();
+    g_active_threads = 0;
 }
 
 } // extern "C"
