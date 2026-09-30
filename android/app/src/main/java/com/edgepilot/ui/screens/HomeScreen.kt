@@ -74,8 +74,9 @@ fun HomeScreen(
             }
         }
 
-        // 会话轮次（v0.4 多轮演示，裁定②）
-        if (uiState.turns.isNotEmpty()) {
+        // 会话轮次（v0.4 多轮演示，裁定②；T5 评审 Critical 收账：OFF 路径不显示——
+        // OFF 跑可能留有隐藏轮记录，拨开时已统一清零，此处仅按开关可见）
+        if (multiTurn && uiState.turns.isNotEmpty()) {
             item {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -225,7 +226,8 @@ private fun BenchmarkInputCard(
                 Text("多轮会话", style = MaterialTheme.typography.bodySmall)
                 Text("开=KV 跨轮复用，输入框只填本轮新内容", fontSize = 11.sp,
                      color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), modifier = Modifier.weight(1f))
-                Switch(checked = multiTurn, onCheckedChange = { v -> onMultiTurnChange(v); if (!v) onClearTurns() })
+                // 拨动开关（任一方向）= 演示会话终结清零 → 拨开后首轮必 cont=false（spec §5.3）
+                Switch(checked = multiTurn, onCheckedChange = { v -> onMultiTurnChange(v); onClearTurns() })
             }
 
             if (isRunning) {
