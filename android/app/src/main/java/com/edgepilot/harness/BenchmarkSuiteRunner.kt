@@ -238,7 +238,7 @@ class BenchmarkSuiteRunner(private val context: Context) {
     /** spec §5.2：同一长 prompt 三档重建 ctx → KV 字节/PSS/贪心 token。串行、每档全新 init。 */
     fun runQuantCompare(modelPath: String, onLog: (String) -> Unit): SuiteOutcome3 {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val dir = File(context.getExternalFilesDir("quant"), stamp)
+        val dir = File(context.getExternalFilesDir("quant"), stamp); dir.mkdirs()   // T7 评审 Critical 收账：getExternalFilesDir 只建父目录，缺此行首写 ENOENT
         val csv = File(dir, "quant.csv"); csv.writeText(QUANT_CSV_HEADER + "\n")
         val runTs = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
         val device = Build.MODEL; val soc = socString()
