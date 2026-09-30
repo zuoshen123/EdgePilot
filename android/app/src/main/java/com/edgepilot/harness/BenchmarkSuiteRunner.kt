@@ -74,6 +74,13 @@ class BenchmarkSuiteRunner(private val context: Context) {
 
     data class SuiteOutcome2(val outDir: File, val cells: List<SessionCell>)
 
+    /** v0.4 量化对比单元（spec §5.2，V2/V5） */
+    data class QuantCell(val bits: Int, val nCtx: Int, val prefillTarget: Int, val totalTokens: Int,
+        val ttftMs: Float, val usedBytes: Long, val totalBytes: Long,
+        val energyJ: Double, val pssPeakMB: Double, val status: String, val note: String = "")
+
+    data class SuiteOutcome3(val outDir: File, val cells: List<QuantCell>)
+
     fun runSuite(
         modelPath: String,
         threadSets: List<Int>,
@@ -228,6 +235,60 @@ class BenchmarkSuiteRunner(private val context: Context) {
         return SuiteOutcome2(dir, cells)
     }
 
+    /** spec §5.2：同一长 prompt 三档重建 ctx → KV 字节/PSS/贪心 token。串行、每档全新 init。 */
+    fun runQuantCompare(modelPath: String, onLog: (String) -> Unit): SuiteOutcome3 {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val dir = File(context.getExternalFilesDir("quant"), stamp)
+        val csv = File(dir, "quant.csv"); csv.writeText(QUANT_CSV_HEADER + "\n")
+        val runTs = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val device = Build.MODEL; val soc = socString()
+        val cells = ArrayList<QuantCell>()
+        // 不伪造守卫（T6 同款，评审裁带入）：Mock 下贪心文本恒空 → 三档假 OK + 空 V5 文件
+        val mock = NativeEngine.kvInfo() == "{}"
+        val long6 = (Prompts.LONG + "\n\n").repeat(6)   // ~3.6K token（4096 档内；降档设备由重试缩量）
+        for (bits in listOf(16, 8, 4)) {
+            if (mock) {
+                cells.add(QuantCell(bits, 0, 0, 0, 0f, 0, 0, Double.NaN, Double.NaN, "ERROR", "Mock 环境（无真实推理）"))
+                csv.appendText(quantRow(runTs, device, soc, cells.last()) + "\n"); continue
+            }
+            val okInit = NativeEngine.init(modelPath, 0, bits)
+            if (!okInit) {
+                cells.add(QuantCell(bits, 0, 0, 0, 0f, 0, 0, Double.NaN, Double.NaN, "ERROR", "加载失败"))
+                csv.appendText(quantRow(runTs, device, soc, cells.last()) + "\n"); continue
+            }
+            val long3 = (Prompts.LONG + "\n\n").repeat(3)
+            var text = long6; var retried = false; var failed = true
+            var doneJson: String? = null; var started = false
+            var agg = SamplerWindow.parse("{}")
+            var out = NativeEngine.parseGenerateOutput("{}")
+            while (true) {
+                NativeEngine.samplerBegin()
+                doneJson = null
+                started = NativeEngine.generateStream(text, 32,
+                    object : NativeEngine.StreamListener {
+                        override fun onToken(piece: String, tokenId: Int) {}
+                        override fun onDone(resultJson: String) { doneJson = resultJson }
+                    }, false, 0f)   // 贪心 temp=0：V5 跨档可比
+                agg = SamplerWindow.parse(NativeEngine.samplerEnd())
+                out = NativeEngine.parseGenerateOutput(doneJson ?: "{}")
+                failed = !started || (out.totalTokens == 0 && out.text.startsWith("[错误]"))
+                if (!failed || retried) break
+                text = long3; retried = true   // 如实缩：预算降档设备半量重试一次（note 记录），再败即 ERROR
+            }
+            val kv = try { JSONObject(NativeEngine.kvInfo()) } catch (e: Exception) { JSONObject() }
+            val c = QuantCell(bits, kv.optInt("n_ctx"), text.length / 4 /*目标tok近似*/, out.totalTokens,
+                out.ttftMs, kv.optLong("used_bytes"), kv.optLong("total_bytes"),
+                if (agg.nPower >= 2) agg.energyMJ / 1000.0 else Double.NaN, agg.pssPeakMB,
+                if (failed) "ERROR" else "OK",
+                if (failed) out.text.take(80) else if (retried) "半量重试(3×LONG)" else "6×LONG")
+            cells.add(c); csv.appendText(quantRow(runTs, device, soc, c) + "\n")
+            if (!failed) File(dir, "quant_tokens_$bits.txt").writeText(out.text)   // V5 源：成功才有文件（不伪造）
+            onLog("bits=$bits: KV ${(c.usedBytes shr 20)}MB/${(c.totalBytes shr 20)}MB · PSS ${if (c.pssPeakMB.isNaN()) "—" else c.pssPeakMB.toInt()}MB ${if (failed) "ERROR" else ""}")
+        }
+        NativeEngine.release()
+        return SuiteOutcome3(dir, cells)
+    }
+
     // ---- 私有辅助 ----
 
     private fun errorCell(idx: Int, bucket: String, th: Int, chars: Int, maxTok: Int,
@@ -274,6 +335,19 @@ class BenchmarkSuiteRunner(private val context: Context) {
             c.submittedChars.toString(), c.maxTokens.toString(), c.totalTokens.toString(),
             fmt(c.ttftMs.toDouble(), 1), fmt(c.itlP99.toDouble(), 1), fmt(c.tokensPerSec.toDouble(), 2),
             fmt(c.energyJ, 3), fmt(c.pssPeakMB, 1), fmt(c.cacheHit, 1), c.status
+        ).joinToString(",")
+    }
+
+    /** 量化行：列序与 QUANT_CSV_HEADER 逐列对应；threads 恒 0=推荐（runbook 注记）；retried 由 note 互证 */
+    private fun quantRow(runTs: String, device: String, soc: String, c: QuantCell): String {
+        return listOf(
+            csvEsc(runTs), csvEsc(device), csvEsc(soc),
+            c.bits.toString(), "0", c.nCtx.toString(),
+            c.prefillTarget.toString(), c.totalTokens.toString(),
+            fmt(c.ttftMs.toDouble(), 1), c.usedBytes.toString(), c.totalBytes.toString(),
+            fmt(c.energyJ, 3), fmt(c.pssPeakMB, 1),
+            if (c.note.startsWith("半量重试")) "1" else "0",
+            c.status, csvEsc(c.note)
         ).joinToString(",")
     }
 
@@ -377,5 +451,10 @@ class BenchmarkSuiteRunner(private val context: Context) {
         const val SESSION_CSV_HEADER = "run_ts,device,android_soc,threads,bucket,turn,cache_mode," +
             "submitted_chars,max_tokens,total_tokens,ttft_ms,itl_p99_ms,tokens_per_sec," +
             "energy_J,pss_peak_mb,cache_hit,status"
+
+        /** v0.4 量化对比 16 列（spec §5.2） */
+        const val QUANT_CSV_HEADER = "run_ts,device,android_soc,kv_bits,threads,n_ctx," +
+            "prefill_target_chars,total_tokens,ttft_ms,used_bytes,total_bytes," +
+            "energy_J,pss_peak_mb,retried,status,note"
     }
 }

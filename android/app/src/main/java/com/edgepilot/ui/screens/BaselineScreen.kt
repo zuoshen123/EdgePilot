@@ -38,6 +38,7 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
     var logs by remember { mutableStateOf(listOf<String>()) }
     var cells by remember { mutableStateOf(listOf<BenchmarkSuiteRunner.CellResult>()) }
     var sessionCells by remember { mutableStateOf(listOf<BenchmarkSuiteRunner.SessionCell>()) }
+    var quantCells by remember { mutableStateOf(listOf<BenchmarkSuiteRunner.QuantCell>()) }
     var outDir by remember { mutableStateOf<String?>(null) }
     var badge by remember { mutableStateOf("能力自检中…") }
 
@@ -100,6 +101,7 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
                 running = true
                 cells = emptyList()
                 sessionCells = emptyList()
+                quantCells = emptyList()
                 outDir = null
                 logs = logs + "矩阵开始: threads=$ths maxTokens=$mt"
                 scope.launch {
@@ -138,6 +140,7 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
                 running = true
                 cells = emptyList()
                 sessionCells = emptyList()
+                quantCells = emptyList()
                 outDir = null
                 logs = logs + "会话矩阵开始: 推荐线程 maxTokens=$mt"
                 scope.launch {
@@ -166,6 +169,44 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
         ) {
             if (!running) Icon(Icons.Default.PlayArrow, contentDescription = null)
             Text(if (running) " 矩阵运行中…" else " 跑会话矩阵（cache on/off×3轮）")
+        }
+
+        // v0.4 量化对比入口（spec §5.2，V2/V5：三档重建灌长文、贪心可比文本导出）
+        Button(
+            onClick = {
+                if (running) return@Button
+                running = true
+                cells = emptyList()
+                sessionCells = emptyList()
+                quantCells = emptyList()
+                outDir = null
+                logs = logs + "量化对比开始: F16/Q8V8/Q8V4 贪心32tok"
+                scope.launch {
+                    try {
+                        val outcome = withContext(Dispatchers.Default) {
+                            runner.runQuantCompare(modelPath) { msg ->
+                                scope.launch(Dispatchers.Main) { logs = logs + msg }
+                            }
+                        }
+                        quantCells = outcome.cells
+                        outDir = outcome.outDir.path
+                        logs = logs + "完成：${outcome.cells.size} 档（quant_tokens_*.txt 供 V5 比对）"
+                    } catch (e: Exception) {
+                        logs = logs + "量化对比异常中止: ${e.message}"
+                    } finally {
+                        // runQuantCompare 内已 release——此处双保险幂等（I-2 交还所有权同主按钮）
+                        NativeEngine.release()
+                        onEngineReleased()
+                        logs = logs + "矩阵结束：引擎已释放，单跑前请回测试 Tab 重新加载模型"
+                        running = false
+                    }
+                }
+            },
+            enabled = !running && modelPath.isNotBlank(),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            if (!running) Icon(Icons.Default.PlayArrow, contentDescription = null)
+            Text(if (running) " 矩阵运行中…" else " 量化对比（F16/Q8V8/Q8V4）")
         }
 
         if (cells.isNotEmpty()) {
@@ -213,6 +254,26 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
                                 modifier = Modifier.width(48.dp),
                                 color = if (c.cacheHit >= 0.5) MetricGood
                                 else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                            Text(c.status, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                color = if (c.status == "OK") MetricGood else MetricBad)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (quantCells.isNotEmpty()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("量化档对比（KV 字节口径，spec §5.2）", style = MaterialTheme.typography.titleSmall)
+                    quantCells.forEach { c ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(when (c.bits) { 8 -> "K8V8"; 4 -> "K8V4"; else -> "F16" },
+                                fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(56.dp))
+                            Text("ctx ${c.nCtx}", fontSize = 12.sp, modifier = Modifier.width(72.dp))
+                            Text("${c.totalTokens}tok", fontSize = 12.sp, modifier = Modifier.width(60.dp))
+                            Text("${c.usedBytes shr 20}/${c.totalBytes shr 20}MB", fontSize = 12.sp,
+                                modifier = Modifier.width(104.dp))
                             Text(c.status, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                 color = if (c.status == "OK") MetricGood else MetricBad)
                         }
