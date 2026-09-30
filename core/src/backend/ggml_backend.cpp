@@ -51,6 +51,28 @@ long long wall_ms() {
 }
 } // namespace
 
+// v0.4 §4：量化档位 → ggml 类型（load/compress/info 三处共用，禁复制散布）。K 保守 Q8（用户裁定④）。
+static void kv_types(int bits, ggml_type& k, ggml_type& v) {
+    switch (bits) {
+        case 8:  k = GGML_TYPE_Q8_0; v = GGML_TYPE_Q8_0; break;
+        case 4:  k = GGML_TYPE_Q8_0; v = GGML_TYPE_Q4_0; break;
+        default: k = GGML_TYPE_F16;  v = GGML_TYPE_F16;  break;
+    }
+}
+
+// loadModel 与 compressKVCache 共用的 ctx 参数组装（v0.4：type_k/v 自 kv_cache_bits 生效）
+static llama_context_params make_cparams(const ModelConfig& config) {
+    auto cp = llama_context_default_params();
+    cp.n_ctx   = config.context_length > 0 ? config.context_length : 2048;
+    cp.n_batch = config.batch_size > 0 ? config.batch_size : 512;
+    cp.n_threads = config.threads > 0 ? config.threads
+                        : std::min(static_cast<int32_t>(std::thread::hardware_concurrency()), 4);
+    cp.n_threads_batch = cp.n_threads;
+    ggml_type tk, tv; kv_types(config.kv_cache_bits, tk, tv);
+    cp.type_k = tk; cp.type_v = tv;
+    return cp;
+}
+
 // nearest-rank 分位数：idx = ceil(q*n) - 1（升序数组）
 static double percentile_nearest_rank(const std::vector<double>& sorted, double q) {
     if (sorted.empty()) return 0.0;
@@ -208,14 +230,38 @@ Status GgmlBackend::loadModel(const ModelConfig& config) {
     impl_->vocab = llama_model_get_vocab(impl_->model);
     EP_LOGI("vocab=%p", (void*)impl_->vocab);
 
-    auto cparams = llama_context_default_params();
-    cparams.n_ctx   = config.context_length > 0 ? config.context_length : 2048;
-    cparams.n_batch = config.batch_size > 0 ? config.batch_size : 512;
-    cparams.n_threads = config.threads > 0 ? config.threads
-                        : std::min(static_cast<int32_t>(std::thread::hardware_concurrency()), 4);
-    cparams.n_threads_batch = cparams.n_threads;
-
-    impl_->ctx = llama_init_from_model(impl_->model, cparams);
+#ifdef __ANDROID__
+    // v0.4 §6/P-ctx：KV 预算校验（按 F16 保守估）——超预算则 ctx 逐档降 4096→2048→1024→512
+    {
+        auto cp = make_cparams(config);
+        const int32_t n_head_mdl   = llama_model_n_head(impl_->model);
+        const int32_t head_dim_mdl = n_head_mdl > 0 ? llama_model_n_embd(impl_->model) / n_head_mdl : 0;  // 零除防御（T3 裁定①）
+        const size_t per_tok_f16 = 2ULL * static_cast<size_t>(llama_model_n_layer(impl_->model))
+            * static_cast<size_t>(llama_model_n_head_kv(impl_->model))
+            * static_cast<size_t>(head_dim_mdl) * 2ULL;
+        struct sysinfo si{};
+        if (per_tok_f16 > 0 && sysinfo(&si) == 0) {
+            size_t avail = si.freeram * si.mem_unit, budget = avail * 55 / 100;
+            const int tiers[4] = {4096, 2048, 1024, 512};
+            int pick = static_cast<int>(cp.n_ctx);
+            for (int t : tiers) {
+                size_t need = static_cast<size_t>(t) * per_tok_f16 * 115 / 100;   // §6 15% 裕量
+                if (need <= budget) { pick = t < static_cast<int>(cp.n_ctx) ? t : static_cast<int>(cp.n_ctx); break; }
+                pick = 512;   // 全超：封顶 512，卡片另行警示
+            }
+            if (pick < static_cast<int>(cp.n_ctx)) {
+                EP_LOGI("KV 预算降档: n_ctx %d→%d (per_tok=%zuB budget=%zuMB)",
+                        static_cast<int>(cp.n_ctx), pick, per_tok_f16, budget >> 20);
+                cp.n_ctx = static_cast<uint32_t>(pick);
+            }
+            impl_->ctx = llama_init_from_model(impl_->model, cp);
+        } else {
+            impl_->ctx = llama_init_from_model(impl_->model, cp);
+        }
+    }
+#else
+    impl_->ctx = llama_init_from_model(impl_->model, make_cparams(config));
+#endif
     if (!impl_->ctx) {
         llama_model_free(impl_->model);
         impl_->model = nullptr;
@@ -580,10 +626,11 @@ KVCacheInfo GgmlBackend::getKVCacheInfo() const {
         const int n_embd     = static_cast<int>(llama_model_n_embd(impl_->model));
         info.num_heads = n_head;
         info.head_dim  = n_head > 0 ? n_embd / n_head : 0;
-        // K+V × 层 × kv头 × head_dim × F16(2B)；默认缓存类型 F16（cparams 未显式量化）
-        const size_t per_tok = 2ULL * static_cast<size_t>(info.num_layers)
-                               * static_cast<size_t>(n_head_kv > 0 ? n_head_kv : n_head)
-                               * static_cast<size_t>(info.head_dim) * 2ULL;
+        // v0.4 §4：按当前 ctx 实际量化类型计字节（ggml_row_size 与 llama 内部分配同式，不猜）
+        ggml_type tk, tv; kv_types(impl_->config.kv_cache_bits, tk, tv);
+        const size_t nkv = static_cast<size_t>(n_head_kv > 0 ? n_head_kv : n_head);
+        const size_t per_tok = static_cast<size_t>(info.num_layers) * nkv
+            * (ggml_row_size(tk, info.head_dim) + ggml_row_size(tv, info.head_dim));
         info.used_memory_bytes  = static_cast<size_t>(impl_->n_past) * per_tok;
         info.total_memory_bytes = static_cast<size_t>(info.max_seq_len) * per_tok;
     }
@@ -677,6 +724,23 @@ bool GgmlBackend::loadSessionFile(const std::string& base) {
 }
 
 void GgmlBackend::clearKVCache() { impl_->resetKVCache(); }
-bool GgmlBackend::compressKVCache(int) { return false; }   // Task 3 兑现
+
+bool GgmlBackend::compressKVCache(int target_bits) {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    if (!isLoaded()) { EP_LOGE("compressKVCache: 未加载"); return false; }
+    if (target_bits != 16 && target_bits != 8 && target_bits != 4) { EP_LOGE("compressKVCache: 非法档位 %d", target_bits); return false; }
+    auto cp = make_cparams(impl_->config);
+    cp.n_ctx = llama_n_ctx(impl_->ctx);                   // 保当前 ctx，预算降档不重演
+    // T3 裁定②：不覆写 n_threads——make_cparams 自 config 解析同值，直抄会把 auto(0) 打成 0 线程
+    ggml_type tk, tv; kv_types(target_bits, tk, tv);
+    cp.type_k = tk; cp.type_v = tv;
+    llama_free(impl_->ctx); impl_->ctx = nullptr;
+    impl_->config.kv_cache_bits = target_bits;
+    impl_->ctx = llama_init_from_model(impl_->model, cp);
+    if (!impl_->ctx) { EP_LOGE("compressKVCache: 重建失败（KV 已弃，模型仍可用重载恢复）"); state_ = InferenceState::ERROR; return false; }
+    impl_->n_past = 0; impl_->session_tokens.clear();     // 重建=清零（spec 裁定④：诚实"需重灌历史"）
+    EP_LOGI("compressKVCache: ctx 已按 bits=%d 重建，KV 清零，历史需重新 prefill", target_bits);
+    return true;
+}
 
 } // namespace edgepilot
