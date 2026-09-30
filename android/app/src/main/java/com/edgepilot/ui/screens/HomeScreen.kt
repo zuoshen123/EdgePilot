@@ -10,8 +10,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.edgepilot.ui.theme.*
 import com.edgepilot.viewmodel.BenchmarkUiState
 
@@ -20,11 +22,13 @@ fun HomeScreen(
     uiState: BenchmarkUiState,
     onDetectHardware: () -> Unit,
     onLoadModel: (String) -> Unit,
-    onRunBenchmark: (String) -> Unit,
-    onCancelBenchmark: () -> Unit
+    onRunBenchmark: (String, Boolean) -> Unit,
+    onCancelBenchmark: () -> Unit,
+    onClearTurns: () -> Unit
 ) {
     var promptText by remember { mutableStateOf("Explain quantum computing in simple terms") }
     var modelPath by remember { mutableStateOf("/data/data/com.edgepilot/files/models/tinyllama.gguf") }
+    var multiTurn by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier
@@ -53,10 +57,13 @@ fun HomeScreen(
             BenchmarkInputCard(
                 prompt = promptText,
                 onPromptChange = { promptText = it },
-                onRun = { onRunBenchmark(promptText) },
+                onRun = { onRunBenchmark(promptText, multiTurn && uiState.turns.isNotEmpty()) },
                 onCancel = onCancelBenchmark,
                 isRunning = uiState.isRunning,
-                enabled = uiState.modelLoaded
+                enabled = uiState.modelLoaded,
+                multiTurn = multiTurn,
+                onMultiTurnChange = { multiTurn = it },
+                onClearTurns = onClearTurns
             )
         }
 
@@ -64,6 +71,21 @@ fun HomeScreen(
         uiState.result?.let { result ->
             item {
                 ResultsCard(result)
+            }
+        }
+
+        // 会话轮次（v0.4 多轮演示，裁定②）
+        if (uiState.turns.isNotEmpty()) {
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("会话轮次（TTFT 逐轮）", style = MaterialTheme.typography.titleSmall)
+                        uiState.turns.forEach { t ->
+                            Text("R${t.turn} · TTFT ${t.ttftMs.toInt()}ms · ${t.totalTokens} tok",
+                                 fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+                }
             }
         }
 
@@ -171,7 +193,10 @@ private fun BenchmarkInputCard(
     onRun: () -> Unit,
     onCancel: () -> Unit,
     isRunning: Boolean,
-    enabled: Boolean
+    enabled: Boolean,
+    multiTurn: Boolean,
+    onMultiTurnChange: (Boolean) -> Unit,
+    onClearTurns: () -> Unit
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -194,6 +219,14 @@ private fun BenchmarkInputCard(
             )
 
             Spacer(modifier = Modifier.height(8.dp))
+
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("多轮会话", style = MaterialTheme.typography.bodySmall)
+                Text("开=KV 跨轮复用，输入框只填本轮新内容", fontSize = 11.sp,
+                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), modifier = Modifier.weight(1f))
+                Switch(checked = multiTurn, onCheckedChange = { v -> onMultiTurnChange(v); if (!v) onClearTurns() })
+            }
 
             if (isRunning) {
                 Button(

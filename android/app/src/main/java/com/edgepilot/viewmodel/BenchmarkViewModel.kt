@@ -28,6 +28,9 @@ data class BenchmarkResult(
     val acceptanceRate: Float = 0f  // 恒 0：无推测解码时不展示（UI 按 >0 隐藏），v0.5 接真实统计
 )
 
+/** v0.4 §5.3：多轮演示逐轮统计（会话终结即清空） */
+data class TurnStat(val turn: Int, val ttftMs: Float, val totalTokens: Int)
+
 data class BenchmarkUiState(
     val isRunning: Boolean = false,
     val currentPrompt: String = "",
@@ -36,7 +39,8 @@ data class BenchmarkUiState(
     val logs: List<String> = emptyList(),
     val error: String? = null,
     val hardwareInfo: String = "",
-    val modelLoaded: Boolean = false
+    val modelLoaded: Boolean = false,
+    val turns: List<TurnStat> = emptyList()
 )
 
 class BenchmarkViewModel : ViewModel() {
@@ -68,21 +72,24 @@ class BenchmarkViewModel : ViewModel() {
                     NativeEngine.init(modelPath)
                 }
                 if (success) {
-                    uiState = uiState.copy(modelLoaded = true, isRunning = false)
+                    // 重载 = 新会话（native KV 重装），演示轮次随之清零（§5.3）
+                    uiState = uiState.copy(modelLoaded = true, isRunning = false, turns = emptyList())
                     addLog("模型加载成功")
                 } else {
                     // 加载失败时 native 引擎必不可用（守卫已 reset）——旗标不许撒谎（I-1c）
                     uiState = uiState.copy(
                         modelLoaded = false,
                         error = "模型加载失败",
-                        isRunning = false
+                        isRunning = false,
+                        turns = emptyList()
                     )
                 }
             } catch (e: Exception) {
                 uiState = uiState.copy(
                     modelLoaded = false,
                     error = "异常: ${e.message}",
-                    isRunning = false
+                    isRunning = false,
+                    turns = emptyList()
                 )
             }
         }
@@ -90,10 +97,13 @@ class BenchmarkViewModel : ViewModel() {
 
     /** 引擎被外部释放（矩阵收尾）：重置加载旗标，单跑强制走全新加载=推荐配置（I-2 握手机制） */
     fun onEngineReleased() {
-        uiState = uiState.copy(modelLoaded = false)
+        uiState = uiState.copy(modelLoaded = false, turns = emptyList())
     }
 
-    fun runBenchmark(prompt: String, maxTokens: Int = 128) {
+    /** 开关拨关：演示轮次清零（native KV 不动，下次运行按新会话重装——§5.3） */
+    fun endSessionDemo() { uiState = uiState.copy(turns = emptyList()) }
+
+    fun runBenchmark(prompt: String, maxTokens: Int = 128, continueSession: Boolean = false) {
         if (!uiState.modelLoaded) {
             uiState = uiState.copy(error = "模型未加载")
             return
@@ -105,9 +115,11 @@ class BenchmarkViewModel : ViewModel() {
             currentPrompt = prompt,
             generatedText = "",
             result = null,
-            error = null
+            error = null,
+            turns = if (continueSession) uiState.turns else emptyList()  // 新会话起算清零（§5.3）
         )
-        addLog("流式推理开始: prompt=${prompt.take(40)}…, maxTokens=$maxTokens")
+        addLog("流式推理开始: prompt=${prompt.take(40)}…, maxTokens=$maxTokens" +
+            if (continueSession) " (续写第 ${uiState.turns.size + 1} 轮)" else "")
 
         viewModelScope.launch {
             val done = CompletableDeferred<String?>()
@@ -125,19 +137,19 @@ class BenchmarkViewModel : ViewModel() {
 
             NativeEngine.samplerBegin()
             val started = withContext(Dispatchers.Default) {
-                NativeEngine.generateStream(prompt, maxTokens, listener)
+                NativeEngine.generateStream(prompt, maxTokens, listener, continueSession)
             }
             val windowJson = NativeEngine.samplerEnd()  // native 路径 onDone 先于返回，窗口已含全程
             if (!started) {
-                uiState = uiState.copy(isRunning = false, error = "流式推理启动失败")
+                uiState = uiState.copy(isRunning = false, error = "流式推理启动失败", turns = emptyList())
                 return@launch
             }
             val resultJson = done.await()  // started ⇒ onDone 必达（native 收尾保证；Mock 见 R7）
 
             val output = NativeEngine.parseGenerateOutput(resultJson ?: "{}")
-            // N4：prefill 失败 → 显式错误，绝不以 0 值假成功上屏
+            // N4：prefill 失败 → 显式错误，绝不以 0 值假成功上屏（会话同判终结，§5.3）
             if (output.totalTokens == 0 && output.text.startsWith("[错误]")) {
-                uiState = uiState.copy(isRunning = false, error = output.text)
+                uiState = uiState.copy(isRunning = false, error = output.text, turns = emptyList())
                 addLog("推理失败: ${output.text}")
                 return@launch
             }
@@ -160,7 +172,8 @@ class BenchmarkViewModel : ViewModel() {
                     itlSeries = output.itlSeries,
                     powerTimeline = agg.powerMw,
                     energyMj = agg.energyMJ.toFloat()
-                )
+                ),
+                turns = uiState.turns + TurnStat(uiState.turns.size + 1, output.ttftMs, output.totalTokens)
             )
             addLog("推理完成: ${output.totalTokens} tokens, ${output.totalTimeMs.toInt()}ms, " +
                 "TTFT ${output.ttftMs.toInt()}ms, ${String.format("%.1f", output.tokensPerSec)} tok/s" +
