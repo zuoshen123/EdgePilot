@@ -19,7 +19,14 @@
 - **性能指标** — 逐 token 采集 TTFT、ITL（Avg/P50/P90/P99）、吞吐量，全部来自真实推理
 - 真机基线矩阵 — 线程数 × 短/中/长 prompt 一键跑完，功耗(tokens/Joule)/温度节流/内存分解逐 cell 导出 CSV+JSON
 - sysfs 资源采集 — 电流×电压积分、thermal_zone 温度、Pss/VmRSS 内存，能力自检矩阵驱动 UI 徽标，不可用通道诚实留空
+- **多轮会话演示** — 测试 Tab「多轮」开关：开=KV 跨轮复用（首轮必全新、续写只填新内容），逐轮 TTFT 卡片；拨动开关即终结演示会话（与引擎 KV 自洽）
+- **会话矩阵 harness** — 基线 Tab cache on/off × 短/中/长桶 × 3 轮 = 18 单元，导出 `session.csv`（V1 降幅口径）
+- **KV 量化三档对比** — F16 / K8V8 / K8V4（K 保守 Q8_0）同长贪心对比，逐档重建 ctx，导出 `quant.csv` + 贪心 token 文本（V2 字节口径 / V5 一致率源）
+- **跨进程会话恢复** — adb intent 触发 save/load，五段校验链（模型指纹/尺寸不符如实 REJECTED），结果留档 `recovery/` 目录
+- **推荐配置卡片** — 已加载=引擎实态 + KV 预算校验（可用内存×0.55）；未加载=预测 + 如实 note；一键应用 threads/kv 到下次加载
 - **KV Cache 管理** — 支持导出、导入、压缩 KV Cache
+
+> **v0.4 行为变化**：低端设备 n_ctx 受 KV 预算自动降档（4096→2048→1024→512 逐档取首个可容纳者；全超则封顶 512 并在推荐卡片警示"当前 KV 超出内存预算"）。
 
 ## 技术架构
 
@@ -122,6 +129,25 @@ EdgePilot/
 3. 输入 Prompt，点击 **开始推理**
 4. 切换到 **指标 Tab** 查看性能数据
 5. 基线 Tab：确认能力徽标 → 选线程集 → 跑完整矩阵 → 按界面提示 `adb pull` 导出目录取 CSV/JSON
+6. 会话矩阵/量化对比：基线 Tab 第二/三按钮（与矩阵互斥串行跑）；Mock 环境不模拟会话，全部单元如实记 ERROR
+7. adb 恢复通道（跨进程会话热恢复，需真机、通道串行执行——跑通道时不要在 UI 并发推理）：
+   ```bash
+   # 导出：t1→t2→存档→贪心探针（探针不入档）
+   adb shell am start -n com.edgepilot/.MainActivity --es ep_session_save rec1
+   adb shell cat /sdcard/Android/data/com.edgepilot/files/recovery/session_export_result.txt   # 须 EXPORTED
+   # 冷恢复：force-stop 杀掉进程后按名载入（intent 参数=存档名，非路径；两文件在应用内部 files/ 目录）
+   adb shell am force-stop com.edgepilot
+   adb shell am start -n com.edgepilot/.MainActivity --es ep_session_load rec1
+   adb shell cat /sdcard/Android/data/com.edgepilot/files/recovery/session_recover_result.txt  # 须 PASS（贪心逐字对）
+   # 拒绝路径示例：改存档 rec1.kvdat.json 的 model_path（或 model_size）推回 → 再 load → REJECTED
+   ```
+   模型路径三处同改（默认同一文件）：`Recovery.kt:14` / `HomeScreen.kt:30` / `BaselineScreen.kt:34`。
+
+### 会话/量化 CSV 字段速览
+
+`session.csv`（17 列）：`run_ts,device,android_soc,threads,bucket,turn,cache_mode,submitted_chars,max_tokens,total_tokens,ttft_ms,itl_p99_ms,tokens_per_sec,energy_J,pss_peak_mb,cache_hit,status` — `cache_hit` 为声明式复用标记（on 模式 R2/R3=1）；NaN 通道列输出为空（不伪造）。
+
+`quant.csv`（16 列）：`run_ts,device,android_soc,kv_bits,threads,n_ctx,prefill_target_chars,total_tokens,ttft_ms,used_bytes,total_bytes,energy_J,pss_peak_mb,retried,status,note` — `threads` 恒 `0`（=推荐档）；`prefill_target_chars` 实为 `len/4` 目标 token 近似；`n_ctx<4096`（预算降档）时长文走半量重试，`retried=1`/`note=半量重试(3×LONG)`（重试后再失败行 `retried=0`，错误文本占 note）；quant 目录无 meta.json——出处即 CSV 每行（spec §5.2 工件集合）。
 
 ## 性能说明
 
