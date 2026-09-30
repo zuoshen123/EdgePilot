@@ -75,7 +75,7 @@ fun HomeScreen(
         }
 
         // 会话轮次（v0.4 多轮演示，裁定②；T5 评审 Critical 收账：OFF 路径不显示——
-        // OFF 跑可能留有隐藏轮记录，拨开时已统一清零，此处仅按开关可见）
+        // OFF 跑可能留有隐藏轮记录，拨动开关时已统一清零，此处仅按开关可见）
         if (multiTurn && uiState.turns.isNotEmpty()) {
             item {
                 Card(modifier = Modifier.fillMaxWidth()) {
