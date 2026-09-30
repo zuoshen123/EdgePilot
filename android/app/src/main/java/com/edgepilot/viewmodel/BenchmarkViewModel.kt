@@ -111,8 +111,14 @@ class BenchmarkViewModel : ViewModel() {
     /** 开关拨关：演示轮次清零（native KV 不动，下次运行按新会话重装——§5.3） */
     fun endSessionDemo() { uiState = uiState.copy(turns = emptyList()) }
 
-    /** v0.4 §6：拉取推荐 JSON（loaded 分支=实态+预算校验；unloaded=预测） */
-    fun fetchRecommendation() { uiState = uiState.copy(recommendation = NativeEngine.recommendation()) }
+    /** v0.4 §6：拉取推荐 JSON（loaded 分支=实态+预算校验；unloaded=预测）。
+     *  native 侧 detectHardware()+getKVCacheInfo 无 JNI_OnLoad 挂——不得在主线程直调（T9 评审 Minor-1） */
+    fun fetchRecommendation() {
+        viewModelScope.launch {
+            val json = withContext(Dispatchers.Default) { NativeEngine.recommendation() }
+            uiState = uiState.copy(recommendation = json)
+        }
+    }
 
     /** 应用=一次性旗标：下次 loadModel 透传推荐 threads/kv（spec §6，ctx 由 native 预算复核）。
      *  应用链语义（T4 评审带入注释）：同 kv 同线程再 apply → 下次 init 三段同值走 fast-path
