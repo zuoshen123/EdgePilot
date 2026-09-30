@@ -75,6 +75,10 @@ public:
     /// 导入 KV Cache 状态
     virtual bool importKVCache(const std::vector<uint8_t>& data) = 0;
 
+    // v0.4 §2: 文件级会话存档（base 无扩展名 → <base>.kvdat + <base>.kvdat.json）
+    virtual bool saveSessionFile(const std::string& base_path) = 0;
+    virtual bool loadSessionFile(const std::string& base_path) = 0;
+
     /// 释放 KV Cache 内存
     virtual void clearKVCache() = 0;
 

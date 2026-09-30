@@ -6,11 +6,14 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -24,6 +27,29 @@ namespace edgepilot {
 
 // 流式/同步早退共用：失败必须让用户看见（N4，spec §⑤）
 static constexpr const char* kPrefillError = "[错误] prefill 失败（可能超出上下文）";
+
+// v0.4 §2：sidecar helper（自家写、自家读，字段固定，不引 JSON 库）
+namespace {
+std::string json_escape_basic(const std::string& s) {   // sidecar 只可能踩双引号与反斜杠（原文 "\ 结尾会行接续吞声明，改述）
+    std::string o; o.reserve(s.size() + 4);
+    for (char c : s) { if (c=='"'||c=='\\') { o+='\\'; o+=c; } else if ((unsigned char)c < 0x20) o += ' '; else o += c; }
+    return o;
+}
+bool sidecar_fetch(const std::string& j, const std::string& key, std::string& out) {
+    // 手写取值：仅支持 "key":"str" 与 "key":number 两型
+    std::string pat = "\"" + key + "\":";
+    size_t p = j.find(pat); if (p == std::string::npos) return false;
+    p += pat.size();
+    if (p >= j.size()) return false;   // 键在尾部无值 → 视为非法（防御，自写文件永不触发）
+    if (j[p] == '"') { size_t e = j.find('"', p+1); if (e==std::string::npos) return false; out = j.substr(p+1, e-p-1); return true; }
+    size_t e = j.find_first_of(",}", p); if (e==std::string::npos) e = j.size();
+    out = j.substr(p, e-p); return true;
+}
+long long wall_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+} // namespace
 
 // nearest-rank 分位数：idx = ceil(q*n) - 1（升序数组）
 static double percentile_nearest_rank(const std::vector<double>& sorted, double q) {
@@ -199,6 +225,7 @@ Status GgmlBackend::loadModel(const ModelConfig& config) {
 
     impl_->sampler = impl_->buildSampler(0.8f);   // v0.3 行为逐字不变（固定 0.8 采样链）
     impl_->n_past = 0;
+    impl_->session_tokens.clear();   // 同上（loadModel 顶部 unload() 已覆盖重载路径，此处防御首载残留）
     impl_->total_tokens_generated = 0;
     impl_->total_generation_ms = 0.0;
     impl_->itl_history.clear();
@@ -213,6 +240,7 @@ void GgmlBackend::unload() {
     if (impl_->model)   { llama_model_free(impl_->model);      impl_->model = nullptr; }
     impl_->vocab = nullptr;
     impl_->n_past = 0;
+    impl_->session_tokens.clear();   // v0.4 T1评审带入：KV 随 ctx 消亡，历史必须同清（防陈旧向量骗过 save 守卫）
     state_ = InferenceState::IDLE;
 }
 
@@ -571,9 +599,84 @@ GenerateResult GgmlBackend::getLastMetrics() const {
     return impl_->last_metrics;
 }
 
-std::vector<uint8_t> GgmlBackend::exportKVCache() const { return {}; }
-bool GgmlBackend::importKVCache(const std::vector<uint8_t>&) { return false; }
+std::vector<uint8_t> GgmlBackend::exportKVCache() const {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    if (!isLoaded()) return {};
+    size_t sz = llama_state_seq_get_size(impl_->ctx, 0);
+    if (sz == 0) return {};
+    std::vector<uint8_t> buf(sz);
+    size_t got = llama_state_seq_get_data(impl_->ctx, buf.data(), sz, 0);
+    if (got == 0) return {};
+    buf.resize(got);
+    return buf;
+}
+bool GgmlBackend::importKVCache(const std::vector<uint8_t>& data) {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    if (!isLoaded() || data.empty()) return false;
+    if (llama_state_seq_set_data(impl_->ctx, data.data(), data.size(), 0) == 0) return false;
+    // 缓冲版无 token 历史载体：长度未知 → n_past=0、session_tokens 清空（文件版恢复不走此路）
+    impl_->n_past = 0; impl_->session_tokens.clear();
+    EP_LOGW("importKVCache(缓冲): 无 token 历史，会话导出在此路径后不可用");
+    return true;
+}
+
+bool GgmlBackend::saveSessionFile(const std::string& base) {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    if (!isLoaded()) { EP_LOGE("saveSessionFile: 引擎未加载"); return false; }
+    if (impl_->session_tokens.empty()) { EP_LOGE("saveSessionFile: 无会话 token 历史（未跑过生成）"); return false; }
+    const std::string kv = base + ".kvdat", meta = kv + ".json";
+    size_t n = llama_state_seq_save_file(impl_->ctx, kv.c_str(), 0,
+                                         impl_->session_tokens.data(), impl_->session_tokens.size());
+    if (n == 0) { EP_LOGE("saveSessionFile: llama_state_seq_save_file 失败 → %s", kv.c_str()); return false; }
+    struct stat st{}; stat(impl_->config.model_path.c_str(), &st);
+    FILE* f = fopen(meta.c_str(), "wb");
+    if (!f) { EP_LOGE("saveSessionFile: sidecar 不可写 %s", meta.c_str()); return false; }
+    fprintf(f, "{\"schema\":\"epkv1\",\"model_path\":\"%s\",\"model_size_bytes\":%lld,\"n_ctx\":%d,\"kv_bits\":%d,\"n_tokens\":%zu,\"saved_at_ms\":%lld}",
+            json_escape_basic(impl_->config.model_path).c_str(), (long long)st.st_size,
+            (int)llama_n_ctx(impl_->ctx), impl_->config.kv_cache_bits,
+            impl_->session_tokens.size(), wall_ms());
+    fclose(f);
+    EP_LOGI("saveSessionFile: %zu tokens → %s", impl_->session_tokens.size(), kv.c_str());
+    return true;
+}
+
+bool GgmlBackend::loadSessionFile(const std::string& base) {
+    std::lock_guard<std::mutex> lock(impl_->mtx);
+    if (!isLoaded()) { EP_LOGE("loadSessionFile: 引擎未加载"); return false; }
+    const std::string kv = base + ".kvdat", meta = kv + ".json";
+    auto reject = [&](const char* why) { EP_LOGE("loadSessionFile 拒绝: %s (%s)", why, base.c_str()); return false; };
+    // 1 两文件存在
+    struct stat st{};
+    if (stat(kv.c_str(), &st) != 0 || st.st_size <= 0) return reject("kvdat 缺失");
+    FILE* mf = fopen(meta.c_str(), "rb"); if (!mf) return reject("sidecar 缺失");
+    std::string j(65536, '\0'); size_t rn = fread(&j[0], 1, j.size(), mf); fclose(mf); j.resize(rn);
+    // 2 schema
+    std::string v;
+    if (!sidecar_fetch(j, "schema", v) || v != "epkv1") return reject("schema 非 epkv1");
+    // 3 模型指纹：路径 + 字节数
+    std::string mpath; long long msz = -1;
+    if (!sidecar_fetch(j, "model_path", mpath) || mpath != impl_->config.model_path) return reject("model_path 不符");
+    { std::string t; if (!sidecar_fetch(j, "model_size_bytes", t)) return reject("size 缺失"); msz = atoll(t.c_str()); }
+    if (stat(impl_->config.model_path.c_str(), &st) != 0 || (long long)st.st_size != msz) return reject("模型文件已变更");
+    // 4 kv_bits
+    { std::string t; int kb = 16; if (sidecar_fetch(j, "kv_bits", t)) kb = atoi(t.c_str());
+      if (kb != impl_->config.kv_cache_bits) return reject("kv_bits 与当前上下文不符"); }
+    // 5 载入（sidecar n_tokens 作容量；llama 原生校验兜底）
+    size_t cap = 0; { std::string t; if (sidecar_fetch(j, "n_tokens", t)) cap = (size_t)strtoull(t.c_str(), nullptr, 10); }
+    if (cap == 0 || cap > (size_t)llama_n_ctx(impl_->ctx)) return reject("n_tokens 非法/超上下文");
+    impl_->resetKVCache();                       // 校验全过后才清场（旧会话在拒绝路径完好）
+    std::vector<llama_token> toks(cap);
+    size_t got = 0;
+    if (llama_state_seq_load_file(impl_->ctx, kv.c_str(), 0, toks.data(), cap, &got) == 0)
+        return reject("llama 状态装载失败（版本/长度/容量）");
+    toks.resize(got);
+    impl_->session_tokens = std::move(toks);
+    impl_->n_past = (int32_t)got;
+    EP_LOGI("loadSessionFile: %zu tokens 恢复（可 continueSession 续写）", got);
+    return true;
+}
+
 void GgmlBackend::clearKVCache() { impl_->resetKVCache(); }
-bool GgmlBackend::compressKVCache(int) { return false; }
+bool GgmlBackend::compressKVCache(int) { return false; }   // Task 3 兑现
 
 } // namespace edgepilot

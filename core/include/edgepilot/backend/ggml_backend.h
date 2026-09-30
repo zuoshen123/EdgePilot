@@ -45,6 +45,8 @@ public:
 
     std::vector<uint8_t> exportKVCache() const override;
     bool importKVCache(const std::vector<uint8_t>& data) override;
+    bool saveSessionFile(const std::string& base_path) override;
+    bool loadSessionFile(const std::string& base_path) override;
     void clearKVCache() override;
     bool compressKVCache(int target_bits) override;
 
