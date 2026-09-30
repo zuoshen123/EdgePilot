@@ -166,7 +166,9 @@ private fun RecommendationCard(jsonStr: String, onApply: () -> Unit) {
             if (o.optBoolean("loaded")) {
                 Text("KV 预估 ${o.optLong("predicted_kv_mb")}MB / 预算 ${o.optLong("budget_mb")}MB（可用×0.55）",
                      fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
-                if (o.optBoolean("insufficient")) Text("内存不足以安全跑长上下文（已封顶 512）", fontSize = 11.sp, color = MetricBad)
+                // T9 二轮裁定：不锁定加载时选档（卡片每次 modelLoaded 迁移都刷新，失败重载/llama 取整
+                // 都可能让当前 ctx≠512）——只断言可证的即时事实
+                if (o.optBoolean("insufficient")) Text("当前 KV 超出内存预算（可用×0.55 口径）", fontSize = 11.sp, color = MetricBad)
             } else Text(o.optString("note", "不可用"), fontSize = 11.sp, color = MetricWarn)
             TextButton(onClick = onApply, enabled = o.optBoolean("loaded")) { Text("应用") }
         }
