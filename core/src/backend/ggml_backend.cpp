@@ -72,6 +72,7 @@ struct GgmlBackend::Impl {
     std::mutex  mtx;
     std::atomic<bool> cancelled{false};
     int32_t     n_past    = 0;    // KV cache 中已有的 token 数
+    std::vector<llama_token> session_tokens;   // 当前会话 token 历史（save_file 必需；reset 清空）
 
     // ---- 指标 ----
     int64_t     total_tokens_generated = 0;
@@ -88,14 +89,38 @@ struct GgmlBackend::Impl {
         ).count();
     }
 
-    llama_sampler* buildSampler() {
+    llama_sampler* buildSampler(float temperature) {
         auto sparams = llama_sampler_chain_default_params();
         llama_sampler* chain = llama_sampler_chain_init(sparams);
+        if (temperature <= 0.0f) {   // v0.4 §2.3 贪心前置：temp≤0 → 确定性采样（replay 一致性基础）
+            llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+            return chain;
+        }
         llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
         llama_sampler_chain_add(chain, llama_sampler_init_top_p(0.95, 1));
-        llama_sampler_chain_add(chain, llama_sampler_init_temp(0.8f));
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
         llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
         return chain;
+    }
+
+    // v0.4 §1.2：续写轮的角色胶水。模板缺失/不适用 → 显式退化文本（演示玩具级，测量真实）
+    std::string chatGlue(const std::string& user_text) {
+        const char* tmpl = model ? llama_model_chat_template(model, nullptr) : nullptr;
+        if (tmpl) {
+            llama_chat_message msg{ "user", user_text.c_str() };   // 本版 struct 仅 {role,content}（llama.h:461-464）
+            std::vector<char> buf(2 * (user_text.size() + 64));
+            int32_t n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), (int32_t)buf.size());
+            if (n >= 0) {
+                if (static_cast<size_t>(n) > buf.size()) {   // 模板输出超预估：按返回值扩容重放一次
+                    buf.resize(n);
+                    n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(), n);
+                    if (n >= 0) return std::string(buf.data(), n);
+                } else {
+                    return std::string(buf.data(), n);
+                }
+            }
+        }
+        return "\n用户: " + user_text + "\n助手:";
     }
 
     std::string tokenToPiece(llama_token token) {
@@ -120,6 +145,7 @@ struct GgmlBackend::Impl {
         if (ctx) {
             llama_memory_clear(llama_get_memory(ctx), true);
             n_past = 0;
+            session_tokens.clear();   // v0.4 §2.1：会话历史随 KV 一同终结
         }
     }
 };
@@ -171,7 +197,7 @@ Status GgmlBackend::loadModel(const ModelConfig& config) {
         return Status::MODEL_LOAD_FAILED;
     }
 
-    impl_->sampler = impl_->buildSampler();
+    impl_->sampler = impl_->buildSampler(0.8f);   // v0.3 行为逐字不变（固定 0.8 采样链）
     impl_->n_past = 0;
     impl_->total_tokens_generated = 0;
     impl_->total_generation_ms = 0.0;
@@ -205,30 +231,42 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     std::lock_guard<std::mutex> lock(impl_->mtx);
     impl_->cancelled = false;
 
+    // v0.4：temp≤0 → 逐调用贪心链（即用即释），否则共享常驻链（v0.3 行为）
+    llama_sampler* greedy = request.temperature <= 0.0f ? impl_->buildSampler(request.temperature) : nullptr;
+    llama_sampler* sampler = greedy ? greedy : impl_->sampler;
+
     double gen_start = Impl::now_ms();
     std::vector<double> token_times;
 
-    // Tokenize prompt
-    auto prompt_tokens = impl_->tokenize(request.prompt, true);
+    // Tokenize prompt（v0.4 §1.1：续写轮不清 KV、不加 BOS，仅提交胶水后的增量）
+    const bool cont = request.continue_session && impl_->n_past > 0;
+    if (request.continue_session && !cont)
+        EP_LOGW("continue_session=true 但无会话态——回退全新装载（P-1）");
+    std::vector<llama_token> prompt_tokens = cont
+        ? impl_->tokenize(impl_->chatGlue(request.prompt), false)
+        : impl_->tokenize(request.prompt, true);
     EP_LOGI("tokenize: %d tokens", (int)prompt_tokens.size());
     if (prompt_tokens.empty()) {
+        if (greedy) llama_sampler_free(greedy);
         result.generated_text = kPrefillError;
         state_ = InferenceState::IDLE;
         return result;
     }
 
-    // Prefill
-    impl_->resetKVCache();
+    if (!cont) impl_->resetKVCache();     // 非续写路径逐字等价（原无条件 reset）
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
                                             static_cast<int32_t>(prompt_tokens.size()));
     int prefill_ret = llama_decode(impl_->ctx, batch);
-    EP_LOGI("prefill decode ret=%d", prefill_ret);
+    EP_LOGI("prefill decode ret=%d (cont=%d, %d tokens)", prefill_ret, cont ? 1 : 0, (int)prompt_tokens.size());
     if (prefill_ret != 0) {
-        result.generated_text = kPrefillError;
+        if (greedy) llama_sampler_free(greedy);
+        result.generated_text = kPrefillError;   // 续写失败不动旧会话（未 append）
         state_ = InferenceState::IDLE;
         return result;
     }
     impl_->n_past += static_cast<int32_t>(prompt_tokens.size());
+    impl_->session_tokens.insert(impl_->session_tokens.end(),
+                                 prompt_tokens.begin(), prompt_tokens.end());
 
     double first_token_time = 0.0;
     int32_t n_predict = request.max_new_tokens > 0 ? request.max_new_tokens : 256;
@@ -237,7 +275,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     for (int32_t i = 0; i < n_predict; ++i) {
         if (impl_->cancelled) break;
 
-        new_token_id = llama_sampler_sample(impl_->sampler, impl_->ctx, -1);
+        new_token_id = llama_sampler_sample(sampler, impl_->ctx, -1);
         if (i < 3) EP_LOGI("sample[%d] id=%d eog=%d", i, new_token_id, llama_vocab_is_eog(impl_->vocab, new_token_id));
         if (llama_vocab_is_eog(impl_->vocab, new_token_id)) break;
 
@@ -249,6 +287,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
         std::string piece = impl_->tokenToPiece(new_token_id);
         result.generated_text += piece;
         result.generated_tokens.push_back(static_cast<int>(new_token_id));
+        impl_->session_tokens.push_back(new_token_id);   // v0.4 §2.1：生成 token 入会话历史
         result.total_tokens++;
         token_times.push_back(Impl::now_ms());
 
@@ -269,6 +308,7 @@ GenerateResult GgmlBackend::generate(const GenerateRequest& request) {
     impl_->total_tokens_generated += result.total_tokens;
     impl_->total_generation_ms += result.total_time_ms;
 
+    if (greedy) llama_sampler_free(greedy);
     state_ = InferenceState::IDLE;
     return result;
 }
@@ -288,12 +328,23 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
     std::lock_guard<std::mutex> lock(impl_->mtx);
     impl_->cancelled = false;
 
+    // v0.4：temp≤0 → 逐调用贪心链（即用即释），否则共享常驻链（v0.3 行为）
+    llama_sampler* greedy = request.temperature <= 0.0f ? impl_->buildSampler(request.temperature) : nullptr;
+    llama_sampler* sampler = greedy ? greedy : impl_->sampler;
+
     double gen_start = Impl::now_ms();
     std::vector<double> token_times;
     GenerateResult run{};
 
-    auto prompt_tokens = impl_->tokenize(request.prompt, true);
+    // v0.4 §1.1：续写轮不清 KV、不加 BOS，仅提交胶水后的增量
+    const bool cont = request.continue_session && impl_->n_past > 0;
+    if (request.continue_session && !cont)
+        EP_LOGW("continue_session=true 但无会话态——回退全新装载（P-1）");
+    std::vector<llama_token> prompt_tokens = cont
+        ? impl_->tokenize(impl_->chatGlue(request.prompt), false)
+        : impl_->tokenize(request.prompt, true);
     if (prompt_tokens.empty()) {
+        if (greedy) llama_sampler_free(greedy);
         run.generated_text = kPrefillError;
         run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
         compute_itl_metrics(run, token_times);
@@ -304,10 +355,11 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
         return;
     }
 
-    impl_->resetKVCache();
+    if (!cont) impl_->resetKVCache();     // 非续写路径逐字等价（原无条件 reset）
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(),
                                             static_cast<int32_t>(prompt_tokens.size()));
     if (llama_decode(impl_->ctx, batch) != 0) {
+        if (greedy) llama_sampler_free(greedy);
         run.generated_text = kPrefillError;
         run.total_time_ms = static_cast<float>(Impl::now_ms() - gen_start);
         compute_itl_metrics(run, token_times);
@@ -318,6 +370,8 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
         return;
     }
     impl_->n_past += static_cast<int32_t>(prompt_tokens.size());
+    impl_->session_tokens.insert(impl_->session_tokens.end(),
+                                 prompt_tokens.begin(), prompt_tokens.end());
 
     int32_t n_predict = request.max_new_tokens > 0 ? request.max_new_tokens : 256;
     llama_token new_token_id = 0;
@@ -329,7 +383,7 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
             break;
         }
 
-        new_token_id = llama_sampler_sample(impl_->sampler, impl_->ctx, -1);
+        new_token_id = llama_sampler_sample(sampler, impl_->ctx, -1);
         if (llama_vocab_is_eog(impl_->vocab, new_token_id)) {
             TokenResult tr{}; tr.is_eos = true;
             callback(tr);
@@ -344,6 +398,7 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
         token_times.push_back(Impl::now_ms());
         run.generated_text += tr.token_text;
         run.generated_tokens.push_back(tr.token_id);
+        impl_->session_tokens.push_back(new_token_id);   // v0.4 §2.1：生成 token 入会话历史
         run.total_tokens++;
         if (run.total_tokens == 1)
             run.ttft_ms = static_cast<float>(Impl::now_ms() - gen_start);
@@ -367,6 +422,7 @@ void GgmlBackend::generateAsync(const GenerateRequest& request, TokenCallback ca
     impl_->total_tokens_generated += run.total_tokens;
     impl_->total_generation_ms += run.total_time_ms;
 
+    if (greedy) llama_sampler_free(greedy);
     state_ = InferenceState::IDLE;
 }
 

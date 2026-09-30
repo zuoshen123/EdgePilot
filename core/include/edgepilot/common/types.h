@@ -78,6 +78,8 @@ struct GenerateRequest {
     float top_p;
     float repeat_penalty;
     std::vector<int> stop_tokens;
+    // v0.4 §1: 会话续写。true = 不清 KV，仅对本轮新文本增量 prefill（空会话态时回退全新，spec 裁定 P-1）
+    bool continue_session = false;
     // 调度信息
     int agent_id;
     Priority priority;
