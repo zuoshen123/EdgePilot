@@ -50,7 +50,7 @@ class BenchmarkViewModel : ViewModel() {
     var uiState by mutableStateOf(BenchmarkUiState())
         private set
 
-    // v0.4 §6：应用推荐的透传旗标（null=默认路径，与 v0.3 全等）；一次性、下次 loadModel 消费
+    // v0.4 §6：应用推荐的透传旗标（null=默认路径，与 v0.3 全等）；apply 后持续生效直至再次 apply（spec "记入 override" 语义，O3 注释收账）
     private var pendingThreads: Int? = null
     private var pendingKvBits: Int? = null
 

@@ -244,7 +244,7 @@ Java_com_edgepilot_native_NativeEngine_nativeGetRecommendationJson(JNIEnv* env, 
         auto i = g_backend->getKVCacheInfo();
         const size_t per_tok = i.max_seq_len > 0 ? i.total_memory_bytes / static_cast<size_t>(i.max_seq_len) : 0;
         const size_t budget = hw.available_memory_bytes * 55 / 100;          // §6 系数 0.55，与 ggml_backend.cpp loadModel 同式（两处各自成文）
-        const bool off = i.total_memory_bytes > budget;  // 当前档仍超预算=insufficient 警示（loadModel 已封顶 512）
+        const bool off = i.total_memory_bytes > budget;  // 即时口径警示（判据=构造义 off，不断言引擎选档，见 T9 二轮裁定）
         std::string j = "{\"loaded\":true,\"ctx\":" + std::to_string(i.max_seq_len) +
             ",\"threads\":" + std::to_string(g_active_threads) +
             ",\"kv_bits\":" + std::to_string(g_active_kv) +

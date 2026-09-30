@@ -157,7 +157,8 @@ private fun HardwareCard(uiState: BenchmarkUiState, onDetectHardware: () -> Unit
 @Composable
 private fun RecommendationCard(jsonStr: String, onApply: () -> Unit) {
     val o = try { JSONObject(jsonStr) } catch (e: Exception) { null }
-    if (o == null) return   // "" / "{}" 之外解析失败=不渲染（无推荐可示）
+    // 不渲染面：""（未拉取）/ 解析失败 / "{}"（异常兜底是合法空 JSON，不抛——须显式判空，O1 收账）
+    if (o == null || o.length() == 0) return
     val kvLabel = when (o.optInt("kv_bits", 16)) { 8 -> "Q8_0 / Q8_0"; 4 -> "Q8_0 / Q4_0(V)"; else -> "F16（默认）" }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {

@@ -232,6 +232,7 @@ Status GgmlBackend::loadModel(const ModelConfig& config) {
 
 #ifdef __ANDROID__
     // v0.4 §6/P-ctx：KV 预算校验（按 F16 保守估）——超预算则 ctx 逐档降 4096→2048→1024→512
+    // （0.55 系数 twin 口径见 edgepilot_jni.cpp nativeGetRecommendationJson 的 budget 式）
     {
         auto cp = make_cparams(config);
         const int32_t n_head_mdl   = llama_model_n_head(impl_->model);
