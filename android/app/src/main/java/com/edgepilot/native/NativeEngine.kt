@@ -50,6 +50,7 @@ object NativeEngine {
     external fun nativeSessionLoad(basePath: String): Boolean
     external fun nativeSetKvQuant(bits: Int): Boolean
     external fun nativeKVInfoJson(): String
+    external fun nativeGetRecommendationJson(): String
 
     /** 流式生成回调（在 native 调用线程触发，实现方自行切主线程） */
     interface StreamListener {
@@ -256,6 +257,11 @@ object NativeEngine {
             try { nativeKVInfoJson() } catch (e: Exception) { Log.e(TAG, "kvInfo 失败: ${e.message}"); "{}" }
         } else "{}"
     }
+
+    /** v0.4 §6 推荐器 JSON：loaded 分支带预算校验，unloaded 分支为预测+note；Mock/异常均如实降级（不伪造推荐） */
+    fun recommendation(): String = if (nativeAvailable) {
+        try { nativeGetRecommendationJson() } catch (e: Exception) { Log.e(TAG, "recommendation 失败: ${e.message}"); "{}" }
+    } else "{\"loaded\":false,\"note\":\"Mock 模式\"}"
 
     fun parseGenerateOutput(json: String): GenerateOutput {
         return try {

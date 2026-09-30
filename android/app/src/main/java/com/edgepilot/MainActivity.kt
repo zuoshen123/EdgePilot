@@ -109,7 +109,9 @@ fun MainApp(viewModel: BenchmarkViewModel = viewModel()) {
                     onLoadModel = { viewModel.loadModel(it) },
                     onRunBenchmark = { p, cont -> viewModel.runBenchmark(p, 128, cont) },
                     onCancelBenchmark = viewModel::cancelRun,
-                    onClearTurns = { viewModel.endSessionDemo() }
+                    onClearTurns = { viewModel.endSessionDemo() },
+                    onRefreshRecommendation = { viewModel.fetchRecommendation() },
+                    onApplyRecommendation = { viewModel.applyRecommendation() }
                 )
                 1 -> MetricsScreen(
                     result = viewModel.uiState.result,

@@ -235,6 +235,31 @@ Java_com_edgepilot_native_NativeEngine_nativeKVInfoJson(JNIEnv* env, jobject)
     return string_to_jstring(env, j);
 }
 
+// v0.4 §6 薄推荐器：loaded=当前引擎实态+预算校验；unloaded=getRecommendedConfig 预测（KV 未校验如实注明）
+JNIEXPORT jstring JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeGetRecommendationJson(JNIEnv* env, jobject)
+{
+    HardwareInfo hw = BackendFactory::detectHardware();
+    if (g_initialized && g_backend) {
+        auto i = g_backend->getKVCacheInfo();
+        const size_t per_tok = i.max_seq_len > 0 ? i.total_memory_bytes / static_cast<size_t>(i.max_seq_len) : 0;
+        const size_t budget = hw.available_memory_bytes * 55 / 100;          // §6 系数 0.55，与 ggml_backend.cpp loadModel 同式（两处各自成文）
+        const bool off = i.total_memory_bytes > budget;  // 当前档仍超预算=insufficient 警示（loadModel 已封顶 512）
+        std::string j = "{\"loaded\":true,\"ctx\":" + std::to_string(i.max_seq_len) +
+            ",\"threads\":" + std::to_string(g_active_threads) +
+            ",\"kv_bits\":" + std::to_string(g_active_kv) +
+            ",\"per_tok_bytes\":" + std::to_string(per_tok) +
+            ",\"predicted_kv_mb\":" + std::to_string(i.total_memory_bytes >> 20) +
+            ",\"budget_mb\":" + std::to_string(budget >> 20) +
+            ",\"insufficient\":" + (off ? "true" : "false") + "}";
+        return string_to_jstring(env, j);
+    }
+    ModelConfig rec = BackendFactory::getRecommendedConfig(hw);
+    std::string j = "{\"loaded\":false,\"ctx\":" + std::to_string(rec.context_length) +
+        ",\"threads\":" + std::to_string(rec.threads) + ",\"kv_bits\":16,\"note\":\"模型未加载：KV 预算未校验\"}";
+    return string_to_jstring(env, j);
+}
+
 JNIEXPORT void JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeGenerateStream(
     JNIEnv* env, jobject, jstring prompt, jint maxTokens, jfloat temperature, jboolean continueSession, jobject listener)

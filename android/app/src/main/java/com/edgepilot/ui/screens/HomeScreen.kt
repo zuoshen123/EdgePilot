@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.edgepilot.ui.theme.*
 import com.edgepilot.viewmodel.BenchmarkUiState
+import org.json.JSONObject
 
 @Composable
 fun HomeScreen(
@@ -24,11 +25,15 @@ fun HomeScreen(
     onLoadModel: (String) -> Unit,
     onRunBenchmark: (String, Boolean) -> Unit,
     onCancelBenchmark: () -> Unit,
-    onClearTurns: () -> Unit
+    onClearTurns: () -> Unit,
+    onRefreshRecommendation: () -> Unit,
+    onApplyRecommendation: () -> Unit
 ) {
     var promptText by remember { mutableStateOf("Explain quantum computing in simple terms") }
     var modelPath by remember { mutableStateOf("/data/data/com.edgepilot/files/models/tinyllama.gguf") }
     var multiTurn by remember { mutableStateOf(false) }
+
+    LaunchedEffect(uiState.modelLoaded) { onRefreshRecommendation() }   // 载/放即刷（loaded 分支切换）
 
     LazyColumn(
         modifier = Modifier
@@ -39,6 +44,11 @@ fun HomeScreen(
         // 硬件信息卡片
         item {
             HardwareCard(uiState, onDetectHardware)
+        }
+
+        // v0.4 §6 推荐配置卡片
+        item {
+            RecommendationCard(uiState.recommendation, onApplyRecommendation)
         }
 
         // 模型加载
@@ -140,6 +150,25 @@ private fun HardwareCard(uiState: BenchmarkUiState, onDetectHardware: () -> Unit
                 Text("点击上方按钮检测硬件",
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
             }
+        }
+    }
+}
+
+@Composable
+private fun RecommendationCard(jsonStr: String, onApply: () -> Unit) {
+    val o = try { JSONObject(jsonStr) } catch (e: Exception) { null }
+    if (o == null) return   // "" / "{}" 之外解析失败=不渲染（无推荐可示）
+    val kvLabel = when (o.optInt("kv_bits", 16)) { 8 -> "Q8_0 / Q8_0"; 4 -> "Q8_0 / Q4_0(V)"; else -> "F16（默认）" }
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("推荐配置", style = MaterialTheme.typography.titleSmall)
+            Text("Context ${o.optInt("ctx")} · 线程 ${o.optInt("threads")} · KV $kvLabel", fontSize = 12.sp)
+            if (o.optBoolean("loaded")) {
+                Text("KV 预估 ${o.optLong("predicted_kv_mb")}MB / 预算 ${o.optLong("budget_mb")}MB（可用×0.55）",
+                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
+                if (o.optBoolean("insufficient")) Text("内存不足以安全跑长上下文（已封顶 512）", fontSize = 11.sp, color = MetricBad)
+            } else Text(o.optString("note", "不可用"), fontSize = 11.sp, color = MetricWarn)
+            TextButton(onClick = onApply, enabled = o.optBoolean("loaded")) { Text("应用") }
         }
     }
 }
