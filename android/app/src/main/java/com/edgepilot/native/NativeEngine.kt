@@ -43,9 +43,13 @@ object NativeEngine {
     }
 
     // ---- Native 方法声明 ----
-    external fun nativeInit(modelPath: String, threads: Int): Boolean
+    external fun nativeInit(modelPath: String, threads: Int, kvBits: Int): Boolean
     external fun nativeGetHardwareInfo(): String
     external fun nativeGenerate(prompt: String, maxTokens: Int): String
+    external fun nativeSessionSave(basePath: String): Boolean
+    external fun nativeSessionLoad(basePath: String): Boolean
+    external fun nativeSetKvQuant(bits: Int): Boolean
+    external fun nativeKVInfoJson(): String
 
     /** 流式生成回调（在 native 调用线程触发，实现方自行切主线程） */
     interface StreamListener {
@@ -53,7 +57,8 @@ object NativeEngine {
         fun onDone(resultJson: String)
     }
 
-    external fun nativeGenerateStream(prompt: String, maxTokens: Int, listener: Any)
+    external fun nativeGenerateStream(prompt: String, maxTokens: Int, temperature: Float,
+                                      continueSession: Boolean, listener: Any)
     external fun nativeCancel()
 
     external fun nativeSamplerProbe(): String
@@ -74,19 +79,20 @@ object NativeEngine {
         """{"power":[],"thermal":[],"mem":[],"n":{"power":0,"thermal":0,"mem":0}}"""
 
     /**
-     * 初始化/重载引擎。同路径同线程数时快速复用（native 侧判断）。
+     * 初始化/重载引擎。同路径同线程数同量化档时快速复用（native 侧判断）。
      * @param threads CPU 线程数，<=0 用推荐配置
+     * @param kvBits KV 量化档 ∈ {16, 8, 4}（spec §4；非法值 native 回 16 并告警）
      */
-    fun init(modelPath: String, threads: Int = 0): Boolean {
+    fun init(modelPath: String, threads: Int = 0, kvBits: Int = 16): Boolean {
         return if (nativeAvailable) {
             try {
-                nativeInit(modelPath, threads)
+                nativeInit(modelPath, threads, kvBits)
             } catch (e: Exception) {
                 Log.e(TAG, "nativeInit 失败: ${e.message}")
                 false
             }
         } else {
-            Log.i(TAG, "[Mock] 初始化: $modelPath (threads=$threads)")
+            Log.i(TAG, "[Mock] 初始化: $modelPath (threads=$threads kv=$kvBits)")
             true
         }
     }
@@ -155,14 +161,18 @@ object NativeEngine {
     /**
      * 流式生成：逐 token 回调，结束后 onDone 携带完整指标 JSON。
      * 调用线程即回调线程，会阻塞到生成结束（应在后台线程调用）。
+     * @param continueSession true = 不清 KV，仅对本轮新文本增量 prefill（空会话态自动回退全新，spec §1）；
+     *        模型重载 / release / setKvQuant 终结会话。
+     * @param temperature ≤0 → 贪心确定性采样（spec §2.3 replay 前置）；默认 0.8 = v0.3 采样链不变。
      * @return 是否成功启动（false = 未初始化/mock 环境失败）
      */
-    fun generateStream(prompt: String, maxTokens: Int, listener: StreamListener): Boolean {
+    fun generateStream(prompt: String, maxTokens: Int, listener: StreamListener,
+                       continueSession: Boolean = false, temperature: Float = 0.8f): Boolean {
         return if (nativeAvailable) {
             var ok = false
             generating = true
             try {
-                nativeGenerateStream(prompt, maxTokens, listener)
+                nativeGenerateStream(prompt, maxTokens, temperature, continueSession, listener)
                 ok = true
             } catch (e: Exception) {
                 Log.e(TAG, "generateStream 失败: ${e.message}", e)
@@ -195,6 +205,52 @@ object NativeEngine {
                 Log.e(TAG, "cancel 失败: ${e.message}")
             }
         }
+    }
+
+    /**
+     * 会话存档：写 `<basePath>.kvdat` + `<basePath>.kvdat.json`（spec §2.1）。
+     * 无会话历史/未加载 → false（不伪造）。
+     */
+    fun sessionSave(basePath: String): Boolean {
+        return if (nativeAvailable) {
+            try { nativeSessionSave(basePath) } catch (e: Exception) {
+                Log.e(TAG, "sessionSave 失败: ${e.message}"); false
+            }
+        } else {
+            Log.i(TAG, "[Mock] sessionSave 不可用（不伪造成功）"); false
+        }
+    }
+
+    /** 会话恢复：五段校验链（存在→schema→模型指纹→kv_bits→llama 兜底），任一不过拒绝（spec §2.2） */
+    fun sessionLoad(basePath: String): Boolean {
+        return if (nativeAvailable) {
+            try { nativeSessionLoad(basePath) } catch (e: Exception) {
+                Log.e(TAG, "sessionLoad 失败: ${e.message}"); false
+            }
+        } else {
+            Log.i(TAG, "[Mock] sessionLoad 不可用（不伪造成功）"); false
+        }
+    }
+
+    /**
+     * 切换 KV 量化档（重建语义，spec 裁定④）：清空 KV，历史需重新 prefill。
+     * Mock：no-op 成功（R7 豁免域，无真实状态可坏）。
+     */
+    fun setKvQuant(bits: Int): Boolean {
+        return if (nativeAvailable) {
+            try { nativeSetKvQuant(bits) } catch (e: Exception) {
+                Log.e(TAG, "setKvQuant 失败: ${e.message}"); false
+            }
+        } else {
+            Log.i(TAG, "[Mock] setKvQuant no-op"); true
+        }
+    }
+
+    /** KV 实时信息 JSON：{"used_bytes","total_bytes","n_ctx","kv_bits"}；不可用返回 "{}"（不伪造） */
+    fun kvInfo(): String {
+        return if (nativeAvailable) {
+            try { nativeKVInfoJson() } catch (e: Exception) { Log.e(TAG, "kvInfo 失败: ${e.message}"); "{}" }
+        } else "{}"
     }
 
     fun parseGenerateOutput(json: String): GenerateOutput {

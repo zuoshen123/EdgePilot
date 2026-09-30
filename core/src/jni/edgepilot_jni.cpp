@@ -15,6 +15,7 @@ static bool g_initialized = false;
 static MetricsCollector g_metrics;         // v0.3 平台资源采样（spec §②）
 static bool g_metrics_started = false;
 static jint g_active_threads = 0;          // 上次成功加载所用的线程数
+static int g_active_kv = 16;               // v0.4：当前生效 KV 量化档（fast-path 第三段 + kvInfo/换档同步）
 static std::string g_model_path;           // 上次成功加载的模型路径
 
 static std::string jstring_to_string(JNIEnv* env, jstring jstr) {
@@ -81,23 +82,29 @@ extern "C" {
 
 JNIEXPORT jboolean JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeInit(
-    JNIEnv* env, jobject, jstring modelPath, jint threads)
+    JNIEnv* env, jobject, jstring modelPath, jint threads, jint kvBits)
 {
     std::string path = jstring_to_string(env, modelPath);
+    auto sane_kv = [](jint b) -> int {
+        if (b == 16 || b == 8 || b == 4) return b;
+        EP_LOGW("nativeInit: 非法 kvBits=%d → 回 16", (int)b); return 16;
+    };
+    const int kvb = sane_kv(kvBits);
     const bool same_path = (path == g_model_path);
     const bool same_threads = (threads <= 0) ? (g_active_threads > 0)
                                              : (threads == g_active_threads);
-    if (g_initialized && same_path && same_threads) {
-        return JNI_TRUE;  // 快速复用：矩阵换 prompt 不重载模型
+    const bool same_kv = (kvb == g_active_kv);
+    if (g_initialized && same_path && same_threads && same_kv) {
+        return JNI_TRUE;  // 快速复用：矩阵换 prompt 不重载模型（v0.4：换档必重载，量化对比依赖此）
     }
-    if (g_initialized) {  // 换模型或换线程数：先卸再载（spec §②，矩阵逐线程列重载）
-        EP_LOGI("nativeInit: 重载 (path_same=%d threads %d->%d)",
-                same_path ? 1 : 0, g_active_threads, (int)threads);
+    if (g_initialized) {  // 换模型/线程/量化档：先卸再载（spec §②，矩阵逐线程列重载）
+        EP_LOGI("nativeInit: 重载 (path_same=%d threads %d->%d kv %d->%d)",
+                same_path ? 1 : 0, g_active_threads, (int)threads, g_active_kv, kvb);
         if (g_backend) { g_backend->unload(); g_backend.reset(); }
         g_initialized = false;
     }
 
-    EP_LOGI("nativeInit: 初始化 EdgePilot (threads=%d)", (int)threads);
+    EP_LOGI("nativeInit: 初始化 EdgePilot (threads=%d kv=%d)", (int)threads, kvb);
     try {
         g_backend = BackendFactory::createOptimal();
         if (!g_backend) { EP_LOGE("创建后端失败"); return JNI_FALSE; }
@@ -106,8 +113,9 @@ Java_com_edgepilot_native_NativeEngine_nativeInit(
         ModelConfig cfg = BackendFactory::getRecommendedConfig(hw);
         cfg.model_path = path;
         if (threads > 0) cfg.threads = threads;
+        cfg.kv_cache_bits = kvb;   // v0.4 §4：覆盖推荐配置的 16 默认（getRecommendedConfig 恒置 16）
 
-        EP_LOGI("加载模型: %s (threads=%d)", cfg.model_path.c_str(), cfg.threads);
+        EP_LOGI("加载模型: %s (threads=%d kv=%d)", cfg.model_path.c_str(), cfg.threads, kvb);
         Status s = g_backend->loadModel(cfg);
         if (s != Status::OK) {
             EP_LOGE("模型加载失败: %s", statusToString(s));
@@ -116,6 +124,7 @@ Java_com_edgepilot_native_NativeEngine_nativeInit(
         }
 
         g_active_threads = cfg.threads;
+        g_active_kv = kvb;
         g_model_path = path;
         g_initialized = true;
 
@@ -135,6 +144,7 @@ Java_com_edgepilot_native_NativeEngine_nativeInit(
     } catch (const std::exception& e) {
         EP_LOGE("异常: %s", e.what());
         g_backend.reset();  // 不留"半构造"后端（M-3）；生成守卫由此走 g_backend==null → 显式异常
+        g_initialized = false;   // nano-N6 收账：异常后不得残留 true（否则 fast-path 谎报可用）
         return JNI_FALSE;
     }
 }
@@ -179,9 +189,48 @@ Java_com_edgepilot_native_NativeEngine_nativeGenerate(
     return string_to_jstring(env, metrics_to_json(res));
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeSessionSave(
+    JNIEnv* env, jobject, jstring base)
+{
+    if (!g_initialized || !g_backend) { EP_LOGE("nativeSessionSave: 未初始化"); return JNI_FALSE; }
+    return g_backend->saveSessionFile(jstring_to_string(env, base)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeSessionLoad(
+    JNIEnv* env, jobject, jstring base)
+{
+    if (!g_initialized || !g_backend) { EP_LOGE("nativeSessionLoad: 未初始化"); return JNI_FALSE; }
+    return g_backend->loadSessionFile(jstring_to_string(env, base)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeSetKvQuant(JNIEnv*, jobject, jint bits)
+{
+    if (!g_initialized || !g_backend) { EP_LOGE("nativeSetKvQuant: 未初始化"); return JNI_FALSE; }
+    if (!g_backend->compressKVCache(bits)) return JNI_FALSE;
+    g_active_kv = bits;   // 与 core 侧 config 同步，防 kvInfo/nativeInit fast-path 说谎
+    return JNI_TRUE;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_edgepilot_native_NativeEngine_nativeKVInfoJson(JNIEnv* env, jobject)
+{
+    std::string j = "{\"used_bytes\":0,\"total_bytes\":0,\"n_ctx\":0,\"kv_bits\":" + std::to_string(g_active_kv) + "}";
+    if (g_initialized && g_backend) {
+        auto i = g_backend->getKVCacheInfo();
+        j = "{\"used_bytes\":" + std::to_string(i.used_memory_bytes) +
+            ",\"total_bytes\":" + std::to_string(i.total_memory_bytes) +
+            ",\"n_ctx\":" + std::to_string(i.max_seq_len) +
+            ",\"kv_bits\":" + std::to_string(g_active_kv) + "}";
+    }
+    return string_to_jstring(env, j);
+}
+
 JNIEXPORT void JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeGenerateStream(
-    JNIEnv* env, jobject, jstring prompt, jint maxTokens, jobject listener)
+    JNIEnv* env, jobject, jstring prompt, jint maxTokens, jfloat temperature, jboolean continueSession, jobject listener)
 {
     if (!g_initialized || !g_backend || !listener) {
         EP_LOGE("nativeGenerateStream: 未初始化或 listener 为空");
@@ -194,7 +243,8 @@ Java_com_edgepilot_native_NativeEngine_nativeGenerateStream(
     GenerateRequest req{};
     req.prompt = jstring_to_string(env, prompt);
     req.max_new_tokens = maxTokens;
-    req.temperature = 0.8f;
+    req.temperature = (float)temperature;          // ≤0 → core 贪心（Task 1）；v0.3 传 0.8 恒非贪心
+    req.continue_session = continueSession == JNI_TRUE;
     req.top_k = 40;
     req.top_p = 0.95f;
 
@@ -276,6 +326,7 @@ Java_com_edgepilot_native_NativeEngine_nativeRelease(JNIEnv*, jobject)
     g_initialized = false;
     g_model_path.clear();
     g_active_threads = 0;
+    g_active_kv = 16;   // v0.4：引擎消亡，量化档回到默认（防跨 release 谎报 fast-path）
 }
 
 } // extern "C"
