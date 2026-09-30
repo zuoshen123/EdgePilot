@@ -172,6 +172,9 @@ class BenchmarkSuiteRunner(private val context: Context) {
         val device = Build.MODEL; val soc = socString()
         val cells = ArrayList<SessionCell>(); var idx = 0; var aborted = false
         val okInit = NativeEngine.init(modelPath, threads)
+        // 不伪造守卫（T6 评审 Important 收账）：Mock 的 generateStream 立即返 true 而 onDone ~560ms 后
+        // 才达，本 runner 不等待 → doneJson 恒 null → 18 行"OK"零值假 CSV。kvInfo()=="{}" 即 Mock 特征。
+        val mock = okInit && NativeEngine.kvInfo() == "{}"
         val totalCells = 2 * SessionScripts.SCRIPTS.size * 3
         for (mode in listOf("off", "on")) {
             for (s in SessionScripts.SCRIPTS) {
@@ -181,8 +184,8 @@ class BenchmarkSuiteRunner(private val context: Context) {
                     val tag = "[$idx/$totalCells] ${s.bucket} ${mode} R${i + 1}"
                     val prompt = if (mode == "off") hist.toString() + text else text
                     val cont = mode == "on" && i > 0
-                    if (aborted || !okInit) {
-                        val note = if (!okInit) "模型加载失败" else "套件已中止"
+                    if (aborted || !okInit || mock) {
+                        val note = if (mock) "Mock 环境（不模拟会话）" else if (!okInit) "模型加载失败" else "套件已中止"
                         val c = SessionCell(idx, s.bucket, i + 1, mode, threads, prompt.length, maxTokens,
                             0, 0f, 0f, 0f, Double.NaN, Double.NaN, if (cont) 1.0 else 0.0, "ERROR", note)
                         cells.add(c); csv.appendText(sessionRow(runTs, device, soc, c) + "\n"); onLog("$tag: ERROR($note)"); return@forEachIndexed
