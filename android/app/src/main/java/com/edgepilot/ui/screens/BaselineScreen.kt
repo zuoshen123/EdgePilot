@@ -37,6 +37,7 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
     var running by remember { mutableStateOf(false) }
     var logs by remember { mutableStateOf(listOf<String>()) }
     var cells by remember { mutableStateOf(listOf<BenchmarkSuiteRunner.CellResult>()) }
+    var sessionCells by remember { mutableStateOf(listOf<BenchmarkSuiteRunner.SessionCell>()) }
     var outDir by remember { mutableStateOf<String?>(null) }
     var badge by remember { mutableStateOf("能力自检中…") }
 
@@ -98,6 +99,7 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
                 val ths = threadsSel.sorted()
                 running = true
                 cells = emptyList()
+                sessionCells = emptyList()
                 outDir = null
                 logs = logs + "矩阵开始: threads=$ths maxTokens=$mt"
                 scope.launch {
@@ -128,6 +130,44 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
             Text(if (running) " 矩阵运行中…" else " 跑完整矩阵（${threadsSel.size * 3} 个 cell）")
         }
 
+        // v0.4 会话矩阵入口（裁定②载体；推荐线程数、单线程集——spec §5.1）
+        Button(
+            onClick = {
+                if (running) return@Button
+                val mt = (maxTokensText.toIntOrNull() ?: 128).coerceAtLeast(1)
+                running = true
+                cells = emptyList()
+                sessionCells = emptyList()
+                outDir = null
+                logs = logs + "会话矩阵开始: 推荐线程 maxTokens=$mt"
+                scope.launch {
+                    try {
+                        val outcome = withContext(Dispatchers.Default) {
+                            runner.runSessionSuite(modelPath, 0 /*推荐线程*/, mt) { msg ->
+                                scope.launch(Dispatchers.Main) { logs = logs + msg }
+                            }
+                        }
+                        sessionCells = outcome.cells
+                        outDir = outcome.outDir.path
+                        logs = logs + "完成，共导出 ${outcome.cells.size} 个会话单元"
+                    } catch (e: Exception) {
+                        logs = logs + "会话矩阵异常中止: ${e.message}"
+                    } finally {
+                        // I-2：与主按钮逐字同构——交还引擎所有权（会话态随 release 终结，§5.3）
+                        NativeEngine.release()
+                        onEngineReleased()
+                        logs = logs + "矩阵结束：引擎已释放，单跑前请回测试 Tab 重新加载模型"
+                        running = false
+                    }
+                }
+            },
+            enabled = !running && modelPath.isNotBlank(),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            if (!running) Icon(Icons.Default.PlayArrow, contentDescription = null)
+            Text(if (running) " 矩阵运行中…" else " 跑会话矩阵（cache on/off×3轮）")
+        }
+
         if (cells.isNotEmpty()) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -151,6 +191,28 @@ fun BaselineScreen(onEngineReleased: () -> Unit = {}) {
                                 else String.format(Locale.US, "%.0fMB", c.pssPeakMB),
                                 fontSize = 12.sp, modifier = Modifier.width(66.dp)
                             )
+                            Text(c.status, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                color = if (c.status == "OK") MetricGood else MetricBad)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (sessionCells.isNotEmpty()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("会话单元（bucket·mode·轮 → TTFT）", style = MaterialTheme.typography.titleSmall)
+                    sessionCells.forEach { c ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("${c.bucket}·${c.cacheMode}·R${c.turn}", fontSize = 12.sp,
+                                modifier = Modifier.width(120.dp))
+                            Text("${c.totalTokens}tok", fontSize = 12.sp, modifier = Modifier.width(60.dp))
+                            Text("${c.ttftMs.toInt()}ms", fontSize = 12.sp, modifier = Modifier.width(76.dp))
+                            Text(if (c.cacheHit >= 0.5) "复用" else "重装", fontSize = 12.sp,
+                                modifier = Modifier.width(48.dp),
+                                color = if (c.cacheHit >= 0.5) MetricGood
+                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
                             Text(c.status, fontSize = 12.sp, fontWeight = FontWeight.Bold,
                                 color = if (c.status == "OK") MetricGood else MetricBad)
                         }

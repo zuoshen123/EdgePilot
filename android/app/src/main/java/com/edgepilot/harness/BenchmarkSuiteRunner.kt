@@ -65,6 +65,15 @@ class BenchmarkSuiteRunner(private val context: Context) {
 
     data class SuiteOutcome(val outDir: File, val cells: List<CellResult>)
 
+    /** v0.4 会话桶单元（spec §5.1：cache off=全量重放基线，on=KV 跨轮复用） */
+    data class SessionCell(val idx: Int, val bucket: String, val turn: Int, val cacheMode: String,
+        val threads: Int, val submittedChars: Int, val maxTokens: Int, val totalTokens: Int,
+        val ttftMs: Float, val itlP99: Float, val tokensPerSec: Float,
+        val energyJ: Double, val pssPeakMB: Double, val cacheHit: Double,
+        val status: String, val note: String = "")
+
+    data class SuiteOutcome2(val outDir: File, val cells: List<SessionCell>)
+
     fun runSuite(
         modelPath: String,
         threadSets: List<Int>,
@@ -149,6 +158,73 @@ class BenchmarkSuiteRunner(private val context: Context) {
         return SuiteOutcome(dir, cells)
     }
 
+    /**
+     * v0.4 会话矩阵（spec §5.1，V1 测量）：{off,on} × 3 桶 × 3 轮 = 18 单元。
+     * off 先跑=纯 v0.3 语义全量重放（hist+新轮做单 prompt、重装 KV），on 后跑=续写复用。
+     * 阻塞式（同 runSuite），调用方置于 Dispatchers.Default。
+     */
+    fun runSessionSuite(modelPath: String, threads: Int, maxTokens: Int,
+                        onLog: (String) -> Unit): SuiteOutcome2 {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val dir = File(context.getExternalFilesDir("session"), stamp); File(dir, "cells").mkdirs()
+        val csv = File(dir, "session.csv"); csv.writeText(SESSION_CSV_HEADER + "\n")
+        val runTs = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val device = Build.MODEL; val soc = socString()
+        val cells = ArrayList<SessionCell>(); var idx = 0; var aborted = false
+        val okInit = NativeEngine.init(modelPath, threads)
+        val totalCells = 2 * SessionScripts.SCRIPTS.size * 3
+        for (mode in listOf("off", "on")) {
+            for (s in SessionScripts.SCRIPTS) {
+                val hist = StringBuilder()
+                s.turns.forEachIndexed { i, text ->
+                    idx++
+                    val tag = "[$idx/$totalCells] ${s.bucket} ${mode} R${i + 1}"
+                    val prompt = if (mode == "off") hist.toString() + text else text
+                    val cont = mode == "on" && i > 0
+                    if (aborted || !okInit) {
+                        val note = if (!okInit) "模型加载失败" else "套件已中止"
+                        val c = SessionCell(idx, s.bucket, i + 1, mode, threads, prompt.length, maxTokens,
+                            0, 0f, 0f, 0f, Double.NaN, Double.NaN, if (cont) 1.0 else 0.0, "ERROR", note)
+                        cells.add(c); csv.appendText(sessionRow(runTs, device, soc, c) + "\n"); onLog("$tag: ERROR($note)"); return@forEachIndexed
+                    }
+                    NativeEngine.samplerBegin()
+                    var doneJson: String? = null
+                    val started = NativeEngine.generateStream(prompt, maxTokens,
+                        object : NativeEngine.StreamListener {
+                            override fun onToken(piece: String, tokenId: Int) {}
+                            override fun onDone(resultJson: String) { doneJson = resultJson }
+                        }, cont)
+                    val agg = SamplerWindow.parse(NativeEngine.samplerEnd())
+                    if (!started) {
+                        aborted = true   // v0.3 同款：停跑保导出
+                        onLog("$tag: ERROR(启动失败·中止)"); cells.add(SessionCell(idx, s.bucket, i + 1, mode, threads,
+                            prompt.length, maxTokens, 0, 0f, 0f, 0f, Double.NaN, Double.NaN, 0.0, "ERROR", "启动失败(中止)"))
+                        csv.appendText(sessionRow(runTs, device, soc, cells.last()) + "\n")
+                        hist.append(text).append("\n\n"); return@forEachIndexed
+                    }
+                    val out = NativeEngine.parseGenerateOutput(doneJson ?: "{}")
+                    val failed = out.totalTokens == 0 && out.text.startsWith("[错误]")
+                    val energyJ = agg.energyMJ / 1000.0
+                    val c = SessionCell(idx, s.bucket, i + 1, mode, threads, prompt.length, maxTokens,
+                        out.totalTokens, out.ttftMs, out.itlP99Ms, out.tokensPerSec,
+                        if (agg.nPower >= 2) energyJ else Double.NaN, agg.pssPeakMB,
+                        if (mode == "on") (if (i > 0) 1.0 else 0.0) else 0.0,   // off=全量重放，无命中（诚实）
+                        if (failed) "ERROR" else "OK", if (failed) out.text.take(80) else "")
+                    cells.add(c); csv.appendText(sessionRow(runTs, device, soc, c) + "\n")
+                    File(dir, "cells/session_${s.bucket}_${mode}_R${i + 1}.json")
+                        .writeText(sessionCellJson(c, prompt, out.itlSeries))
+                    onLog("$tag: TTFT ${c.ttftMs.toInt()}ms · ${c.totalTokens}tok ${if (c.status == "OK") "" else "ERROR"}")
+                    hist.append(text).append("\n").append(out.text).append("\n\n")
+                }
+            }
+        }
+        writeMeta(File(dir, "meta.json"), runTs, device, soc, File(modelPath),
+            if (File(modelPath).canRead()) sha256_16(File(modelPath)) else "",
+            batteryPercent(), batteryPercent(), listOf(threads), maxTokens,
+            try { JSONObject(NativeEngine.samplerProbe()) } catch (e: Exception) { JSONObject() }, cells.size)
+        return SuiteOutcome2(dir, cells)
+    }
+
     // ---- 私有辅助 ----
 
     private fun errorCell(idx: Int, bucket: String, th: Int, chars: Int, maxTok: Int,
@@ -185,6 +261,32 @@ class BenchmarkSuiteRunner(private val context: Context) {
             fmt(c.tempStartC, 1), fmt(c.tempPeakC, 1), fmt(c.pssPeakMB, 1),
             c.powerSource, c.thermalSource, c.status
         ).joinToString(",")
+    }
+
+    /** 会话行：列序与 SESSION_CSV_HEADER 逐列对应；NaN→空（不伪造） */
+    private fun sessionRow(runTs: String, device: String, soc: String, c: SessionCell): String {
+        return listOf(
+            csvEsc(runTs), csvEsc(device), csvEsc(soc),
+            c.threads.toString(), csvEsc(c.bucket), c.turn.toString(), c.cacheMode,
+            c.submittedChars.toString(), c.maxTokens.toString(), c.totalTokens.toString(),
+            fmt(c.ttftMs.toDouble(), 1), fmt(c.itlP99.toDouble(), 1), fmt(c.tokensPerSec.toDouble(), 2),
+            fmt(c.energyJ, 3), fmt(c.pssPeakMB, 1), fmt(c.cacheHit, 1), c.status
+        ).joinToString(",")
+    }
+
+    private fun sessionCellJson(c: SessionCell, prompt: String, itl: List<Double>): String {
+        val o = JSONObject()
+        o.put("idx", c.idx).put("bucket", c.bucket).put("turn", c.turn)
+        o.put("cache_mode", c.cacheMode).put("threads", c.threads)
+        o.put("prompt", prompt).put("submitted_chars", c.submittedChars).put("max_tokens", c.maxTokens)
+        o.put("status", c.status).put("note", c.note)
+        o.put("total_tokens", c.totalTokens)
+        o.put("ttft_ms", c.ttftMs.toDouble()).put("itl_p99_ms", c.itlP99.toDouble())
+        o.put("tokens_per_sec", c.tokensPerSec.toDouble())
+        o.put("itl_series", JSONArray(itl))
+        o.put("energy_J", jsonNum(c.energyJ)).put("pss_peak_mb", jsonNum(c.pssPeakMB))
+        o.put("cache_hit", jsonNum(c.cacheHit))
+        return o.toString(2)
     }
 
     private fun cellJson(c: CellResult, prompt: String, itl: List<Double>, windowJson: String): String {
@@ -267,5 +369,10 @@ class BenchmarkSuiteRunner(private val context: Context) {
             "max_tokens,total_tokens,ttft_ms,itl_p50_ms,itl_p90_ms,itl_p99_ms,tokens_per_sec," +
             "energy_J,avg_power_mw,peak_power_mW,tokens_per_joule,temp_start_c,temp_peak_c," +
             "pss_peak_mb,power_source,thermal_source,status"
+
+        /** v0.4 会话桶 17 列（v0.3 23 列 bench.csv 冻结不动，spec §5.1） */
+        const val SESSION_CSV_HEADER = "run_ts,device,android_soc,threads,bucket,turn,cache_mode," +
+            "submitted_chars,max_tokens,total_tokens,ttft_ms,itl_p99_ms,tokens_per_sec," +
+            "energy_J,pss_peak_mb,cache_hit,status"
     }
 }

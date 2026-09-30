@@ -209,7 +209,14 @@ JNIEXPORT jboolean JNICALL
 Java_com_edgepilot_native_NativeEngine_nativeSetKvQuant(JNIEnv*, jobject, jint bits)
 {
     if (!g_initialized || !g_backend) { EP_LOGE("nativeSetKvQuant: 未初始化"); return JNI_FALSE; }
-    if (!g_backend->compressKVCache(bits)) return JNI_FALSE;
+    if (!g_backend->compressKVCache(bits)) {
+        // T4 评审 Important 收账：重建失败后 core ctx 已死（model 在、bits 已前推），
+        // fast-path 无从知晓——整体清场，让下一次 init 真重载，而非谎报 TRUE 直到 isLoaded 拦截
+        EP_LOGW("nativeSetKvQuant: 重建失败——清场，下次 init 重载恢复");
+        g_backend->unload(); g_backend.reset();
+        g_initialized = false; g_model_path.clear(); g_active_threads = 0; g_active_kv = 16;
+        return JNI_FALSE;
+    }
     g_active_kv = bits;   // 与 core 侧 config 同步，防 kvInfo/nativeInit fast-path 说谎
     return JNI_TRUE;
 }

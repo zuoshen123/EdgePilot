@@ -246,7 +246,11 @@ object NativeEngine {
         }
     }
 
-    /** KV 实时信息 JSON：{"used_bytes","total_bytes","n_ctx","kv_bits"}；不可用返回 "{}"（不伪造） */
+    /**
+     * KV 实时信息 JSON：{"used_bytes","total_bytes","n_ctx","kv_bits"}。
+     * 两种"无数据"编码：native 未初始化 → 各字节/条数字段为 0 的满形 JSON；
+     * Mock/异常 → "{}"。调用方以 used_bytes==0 && n_ctx==0 判"引擎未就绪"。
+     */
     fun kvInfo(): String {
         return if (nativeAvailable) {
             try { nativeKVInfoJson() } catch (e: Exception) { Log.e(TAG, "kvInfo 失败: ${e.message}"); "{}" }
