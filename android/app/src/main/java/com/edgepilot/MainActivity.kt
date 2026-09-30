@@ -46,7 +46,11 @@ class MainActivity : ComponentActivity() {
 
     private fun handleEpIntent(i: Intent) {
         val save = i.getStringExtra("ep_session_save"); val load = i.getStringExtra("ep_session_load")
-        i.removeExtra("ep_session_save"); i.removeExtra("ep_session_load")   // 一次性消费：旋转/热启动不重放（spec §8.6）
+        // 一次性消费=进程内语义（spec §8.6）：旋转被 configChanges 吸收、热启动不重放。
+        // 边界如实注记（终评 M2）：removeExtra 只改本进程副本——进程死后从 Recents 重启，
+        // 系统重投原始 intent → 通道会重跑一次（Recovery 全程如实重算、以 release 收尾，无伪造；
+        // 结果文件被同名覆写）。验收期用 am start 显式驱动，勿以 Recents 恢复代替。
+        i.removeExtra("ep_session_save"); i.removeExtra("ep_session_load")
         val base = save ?: load ?: return
         lifecycleScope.launch {
             val res = withContext(Dispatchers.Default) {

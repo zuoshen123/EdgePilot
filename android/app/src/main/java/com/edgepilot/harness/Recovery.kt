@@ -40,7 +40,7 @@ object Recovery {
         if (!NativeEngine.init(MODEL)) return "REJECTED: 模型加载失败"
         val t1 = turn(SessionScripts.RECOVERY[0], false); if (bad(t1)) return "REJECTED: 首轮失败"
         val t2 = turn(SessionScripts.RECOVERY[1], true);  if (bad(t2)) return "REJECTED: 次轮失败"
-        if (!NativeEngine.sessionSave(base)) return "FAILED: sessionSave（原因见 logcat EP）"   // 先存档（t2 末态，裁定 P-save）
+        if (!NativeEngine.sessionSave(base)) return "FAILED: sessionSave（原因见 logcat EdgePilot）"   // 先存档（t2 末态，裁定 P-save）
         val probe = turn(SessionScripts.PROBE, true);     if (bad(probe)) return "FAILED: probe 轮失败"
         File(dir, "replay_baseline.txt").writeText(probe.text)
         log("probe ${probe.totalTokens} tok 已留基线")
@@ -49,7 +49,7 @@ object Recovery {
 
     private suspend fun loadFlow(base: String, dir: File, log: (String) -> Unit): String {
         if (!NativeEngine.init(MODEL)) return "REJECTED: 模型加载失败"
-        if (!NativeEngine.sessionLoad(base)) return "REJECTED: 存档校验失败（原因见 logcat EP）"
+        if (!NativeEngine.sessionLoad(base)) return "REJECTED: 存档校验失败（原因见 logcat EdgePilot）"
         val bl = File(dir, "replay_baseline.txt")
         if (!bl.canRead()) return "REJECTED: replay_baseline.txt 缺失"
         val probe = turn(SessionScripts.PROBE, true)      // 导入态 n_past>0 → 续写

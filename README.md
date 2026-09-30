@@ -135,13 +135,14 @@ EdgePilot/
    # 导出：t1→t2→存档→贪心探针（探针不入档）
    adb shell am start -n com.edgepilot/.MainActivity --es ep_session_save rec1
    adb shell cat /sdcard/Android/data/com.edgepilot/files/recovery/session_export_result.txt   # 须 EXPORTED
-   # 冷恢复：force-stop 杀掉进程后按名载入（intent 参数=存档名，非路径；两文件在应用内部 files/ 目录）
+   # 冷恢复：force-stop 杀掉进程后按名载入（intent 参数=存档名，非路径；存档两文件在外部 files/recovery/ 目录，与结果文件同级 adb 可见）
    adb shell am force-stop com.edgepilot
    adb shell am start -n com.edgepilot/.MainActivity --es ep_session_load rec1
    adb shell cat /sdcard/Android/data/com.edgepilot/files/recovery/session_recover_result.txt  # 须 PASS（贪心逐字对）
-   # 拒绝路径示例：改存档 rec1.kvdat.json 的 model_path（或 model_size）推回 → 再 load → REJECTED
+   # 拒绝路径示例：adb pull /sdcard/Android/data/com.edgepilot/files/recovery/rec1.kvdat.json
+   # 改 model_path（或 model_size）后 adb push 回同路径 → force-stop → 再 load → REJECTED
    ```
-   模型路径三处同改（默认同一文件）：`Recovery.kt:14` / `HomeScreen.kt:30` / `BaselineScreen.kt:34`。
+   模型路径三处同改（默认同一文件）：`Recovery.kt:14` / `HomeScreen.kt:33` / `BaselineScreen.kt:34`。
 
 ### 会话/量化 CSV 字段速览
 
